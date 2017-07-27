@@ -7,6 +7,8 @@ from string import ascii_letters as ASCII
 import msgpack
 from asgiref.base_layer import BaseChannelLayer
 from cached_property import threaded_cached_property
+from channels.message import Message
+from channels.signals import worker_ready
 from pika import SelectConnection, URLParameters
 from pika.channel import Channel
 from pika.exceptions import ChannelClosed, ConnectionClosed
@@ -30,6 +32,7 @@ GROUP_DISCARD = 4
 SEND_GROUP = 5
 DECLARE_DEAD_LETTERS = 6
 EXPIRE_GROUP_MEMBER = 7
+WORKER_SUBSCRIBE = 8
 
 
 class Protocol(object):
@@ -728,6 +731,96 @@ class ConnectionThread(Thread):
         return self.connection.schedule(f, *args, **kwargs)
 
 
+class WorkerProtocol(Protocol):
+    """Worker protocol."""
+
+    def __init__(self, *args, **kwargs):
+
+        super(WorkerProtocol, self).__init__(*args, **kwargs)
+        # FIXME: Aaaaaaa O_o
+        self.methods[WORKER_SUBSCRIBE] = self.subscribe_to_channels
+
+    def subscribe_to_channels(self, channel_layer, router, channels):
+        """Subscribe to worker channels."""
+
+        self.channel_layer = channel_layer
+        self.router = router
+        for channel in channels:
+            self.amqp_channel.queue_declare(
+                partial(self.start_worker_consumer, channel),
+                queue=self.get_queue_name(channel),
+                arguments=self.queue_arguments,
+            )
+
+    def start_worker_consumer(self, channel, method_frame):
+        """Start worker consumer."""
+
+        self.amqp_channel.basic_consume(
+            partial(self.handle_message, channel),
+            self.get_queue_name(channel),
+        )
+
+    def handle_message(self, channel, amqp_channel, method_frame, properties,
+                       body):
+        """Handle message on the worker side."""
+
+        amqp_channel.basic_ack(method_frame.delivery_tag)
+        content = self.deserialize(body)
+
+        message = Message(
+            content=content,
+            channel_name=channel,
+            channel_layer=self.channel_layer,
+        )
+        match = self.router.match(message)
+        consumer, kwargs = match
+        # FIXME: Mane normal thread worker pool.
+        Thread(target=consumer, args=(message,), kwargs=kwargs).start()
+
+
+class RabbitmqWorker(RabbitmqConnection):
+    """RabbitMQ optimized worker."""
+
+    Protocol = WorkerProtocol
+
+    def __init__(
+            self,
+            url,
+            expiry,
+            group_expiry,
+            get_capacity,
+            crypter,
+            router,
+            channels,
+            callback,
+    ):
+
+        super(RabbitmqWorker, self).__init__(url, expiry, group_expiry,
+                                             get_capacity, crypter)
+        # FIXME: This is insane...  It's a loop reference.
+        self.channel_layer = WorkerLayer(self)
+        self.router = router
+        self.channels = channels
+
+    def start_loop(self, connection):
+        """Connection open callback."""
+
+        self.is_open.set()
+        self.process(None, (DECLARE_DEAD_LETTERS, (), {}), Future())
+        self.process(
+            get_ident(),
+            (WORKER_SUBSCRIBE, (self.channel_layer, self.router,
+                                self.channels,), {}),
+            Future(),
+        )
+
+    def ready(self):
+        """
+        Called once worker setup is complete.
+        """
+        worker_ready.send(sender=self)
+
+
 class RabbitmqChannelLayer(BaseChannelLayer):
     """
     RabbitMQ channel layer.
@@ -740,6 +833,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     extensions = ['groups']
 
     Thread = ConnectionThread
+    Worker = RabbitmqWorker
 
     def __init__(self,
                  url,
@@ -755,6 +849,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             capacity=capacity,
             channel_capacity=channel_capacity,
         )
+        self.url = url
         if symmetric_encryption_keys:
             try:
                 from cryptography.fernet import MultiFernet
@@ -763,12 +858,19 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             sub_fernets = [
                 self.make_fernet(key) for key in symmetric_encryption_keys
             ]
-            crypter = MultiFernet(sub_fernets)
+            self.crypter = MultiFernet(sub_fernets)
         else:
-            crypter = None
+            self.crypter = None
         # Connection thread will be started on first method access.
         self._thread = self.Thread(url, expiry, group_expiry,
-                                   self.get_capacity, crypter)
+                                   self.get_capacity, self.crypter)
+
+    def get_worker(self, router, channels, callback):
+        """Return configured worker instance."""
+
+        return self.Worker(self.url, self.expiry, self.group_expiry,
+                           self.get_capacity, self.crypter, router, channels,
+                           callback)
 
     @threaded_cached_property
     def thread(self):
@@ -846,6 +948,40 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             pass
 
 
+# FIXME: Fucking kill me...
+
+
+class WorkerLayer(RabbitmqChannelLayer):
+
+    def __init__(self, connection):
+
+        self.thread = DummyThread(connection)
+
+
+class DummyThread(object):
+
+    def __init__(self, connection):
+
+        self.connection = connection
+
+    def schedule(self, f, *args, **kwargs):
+
+        return self.connection.schedule(f, *args, **kwargs)
+
+
 # TODO: Is it optimal to read bytes from content frame, call python
 # decode method to convert it to string and than parse it with
 # msgpack?  We should minimize useless work on message receive.
+#
+# TODO: Layer worker.
+#
+# 1. Own worker protocol. One AMQP channel for dead letters, one AMQP
+# channels for channel consumer, one AMQP channel per worker thread.
+#
+# 2. Thread based workers.
+#
+# 3. Don't pass channel layer to the worker constructor directly.  We
+# already have this instance.  Use get method.
+#
+# 4. We have HELL of cyclic dependencies of instantiation of worker
+# and its channel layer.

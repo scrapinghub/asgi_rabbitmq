@@ -474,6 +474,9 @@ class Protocol(object):
                 amqp_channel.queue_delete(queue=queue)
             else:
                 amqp_channel.exchange_delete(exchange=queue)
+        elif reason == 'maxlen' and self.is_expire_marker(queue):
+            # Existing group membership was updated second time.
+            return
         elif reason == 'maxlen' and '!' in queue:
             # Send group method was applied to the process local
             # channel.  Redeliver message to the right queue.

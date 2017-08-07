@@ -527,6 +527,28 @@ class RabbitmqChannelLayerTest(RabbitmqLayerTestCaseMixin, SimpleTestCase,
         self.channel_layer.send('foo.xxx!yyy', {'bar': 'baz'})
         assert {'foo.xxx!', 'dead-letters'} == self.defined_queues
 
+    def test_continuous_group_add_handle_expire_marker(self):
+        """
+        When we sequentially call `group_add` it create expiration marker
+        queue.  This queue has maximum length equal to one.  Marker
+        message from previous call will be dead lettered with `maxlen`
+        reason.  This message should be dropped without further
+        processing.
+
+
+        Initial issue: https://github.com/proofit404/asgi_rabbitmq/pull/10
+        """
+
+        # Hack to declare `expire.bind.foo.xxx!` queue.
+        self.channel_layer.receive(['expire.bind.foo.xxx!'])
+        # Sequentially add channel to the group.
+        self.channel_layer.group_add('foo', 'xxx!a')
+        self.channel_layer.group_add('foo', 'xxx!a')
+        # Check if message was dropped in the dead letters handler.
+        channel, message = self.channel_layer.receive(['expire.bind.foo.xxx!'])
+        assert channel is None
+        assert message is None
+
 
 class RabbitmqLocalChannelLayerTest(RabbitmqChannelLayerTest):
 

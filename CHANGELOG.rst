@@ -4,6 +4,12 @@
 Changelog
 ---------
 
+0.5.3 (2017-08-08)
+++++++++++++++++++
+
+- Drop group membership marker on continuous `group_add` calls.
+- Fix send to the empty group.
+
 0.5.2 (2017-06-07)
 ++++++++++++++++++
 

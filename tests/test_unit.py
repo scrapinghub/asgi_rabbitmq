@@ -68,6 +68,9 @@ class RabbitmqChannelLayerTest(RabbitmqLayerTestCaseMixin, SimpleTestCase,
 
         self.skip_if_no_extension('groups')
         self.channel_layer.send_group('tgroup_1', {'value': 'orange'})
+        # After send to an empty group we should be able to use layer
+        # without error triggered by `send_group`.
+        self.channel_layer.receive(['foo'])
 
     def test_discard_from_empty_group(self):
         """Discard from empty group works as usual."""

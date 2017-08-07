@@ -93,8 +93,9 @@ implemented as fanout exchanges.  With some additions.
 Send
 ~~~~
 
-To send message to the group we need to publish it to the exchange
-named after group.
+To send the message to the group we need to publish it to the exchange
+named after group.  We declare exchange which name equals to the group
+name before each send call.
 
 Add
 ~~~

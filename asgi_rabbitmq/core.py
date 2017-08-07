@@ -357,6 +357,18 @@ class Protocol(object):
             )
 
     def send_group(self, group, message):
+        """
+        Declare group exchange.  Pass execution to the group declared
+        callback.
+        """
+
+        self.amqp_channel.exchange_declare(
+            partial(self.group_declared, group, message),
+            exchange=group,
+            exchange_type='fanout',
+        )
+
+    def group_declared(self, group, message, method_frame):
         """Publish the message to the group exchange."""
 
         body = self.serialize(message)

@@ -191,6 +191,9 @@ def wrap(method, callback):
     Used to measure low-level AMQP frame operations.
     """
 
+    if callback is None:
+        return
+
     start = time.time()
 
     def wrapper(*args):

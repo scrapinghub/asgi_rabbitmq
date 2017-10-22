@@ -4,6 +4,11 @@
 Changelog
 ---------
 
+0.5.4 (2017-10-22)
+++++++++++++++++++
+
+- Upgrade `pika` library to the `0.11`.  Fix some framing errors.
+
 0.5.3 (2017-08-08)
 ++++++++++++++++++
 

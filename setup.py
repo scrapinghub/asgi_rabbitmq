@@ -4,7 +4,7 @@ readme = open('README.rst').read() + open('CHANGELOG.rst').read()
 
 setup(
     name='asgi_rabbitmq',
-    version='0.5.3',
+    version='0.5.4',
     description='RabbitMQ backend for ASGI',
     long_description=readme,
     url='https://github.com/proofit404/asgi_rabbitmq',

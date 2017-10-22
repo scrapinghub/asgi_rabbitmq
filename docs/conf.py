@@ -12,8 +12,8 @@ project = 'asgi_rabbitmq'
 copyright = '2017, Django Software Foundation'
 author = 'Django Software Foundation'
 
-version = '0.5.3'
-release = '0.5.3'
+version = '0.5.4'
+release = '0.5.4'
 
 language = None
 

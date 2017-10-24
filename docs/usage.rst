@@ -77,7 +77,7 @@ You can pass additional SSL arguments in the connection query string:
 
 .. code:: python
 
-    import urllib
+    from urllib import urlencode
 
     CHANNEL_LAYERS = {
         'default': {

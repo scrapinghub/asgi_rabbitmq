@@ -615,7 +615,7 @@ class RabbitmqConnection(object):
         self.connection = self.Connection(
             parameters=self.parameters,
             on_open_callback=self.start_loop,
-            on_close_callback=self.notify_futures,
+            on_close_callback=self.teardown_loop,
             on_callback_error_callback=self.protocol_error,
             stop_ioloop_on_close=False,
             lock=self.lock,
@@ -631,6 +631,26 @@ class RabbitmqConnection(object):
 
         self.is_open.set()
         self.process(None, (DECLARE_DEAD_LETTERS, (), {}), Future())
+
+    def teardown_loop(self, connection, code, msg):
+        """
+        Connection close callback.  By default notify all waiting threads
+        about connection state, then teardown event loop.
+        """
+
+        try:
+            self.protocol_error(ConnectionClosed())
+        finally:
+            self.connection.ioloop.stop()
+
+    def protocol_error(self, error):
+        """
+        Notify threads waited for results that fatal error happens inside
+        connection event loop.
+        """
+
+        for protocol in self.protocols.values():
+            protocol.resolve.set_exception(error)
 
     def process(self, ident, method, future):
         """
@@ -659,27 +679,6 @@ class RabbitmqConnection(object):
         amqp_channel.on_callback_error_callback = protocol.protocol_error
         # Remember protocol for future use.
         self.protocols[ident] = protocol
-
-    def notify_futures(self, connection, code, msg):
-        """
-        Connection close callback.  By default notify all waiting threads
-        about connection state, then teardown event loop.
-        """
-
-        try:
-            for protocol in self.protocols.values():
-                protocol.resolve.set_exception(ConnectionClosed())
-        finally:
-            self.connection.ioloop.stop()
-
-    def protocol_error(self, error):
-        """
-        Notify threads waited for results that fatal error happens inside
-        connection event loop.
-        """
-
-        for protocol in self.protocols.values():
-            protocol.resolve.set_exception(error)
 
     def schedule(self, f, *args, **kwargs):
         """

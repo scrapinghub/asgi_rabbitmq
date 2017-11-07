@@ -10,3 +10,4 @@ tabulate>=0.7
 statistics ; python_version < "3.0"
 git+https://github.com/django/channels.git#egg=channels-benchmark&subdirectory=testproject
 cryptography
+hunter

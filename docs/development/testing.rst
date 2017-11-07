@@ -36,3 +36,33 @@ can do the same with::
 If RabbitMQ is running on different host you have few environment
 variables (like ``RABBITMQ_HOST`` and ``RABBITMQ_PORT``) to specify
 this endpoint.
+
+Development
+===========
+
+Sometimes it's handy just jump into a live process and hack some
+things.  You can run Channels infrastructure with following commands::
+
+    docker-compose run --rm \
+        -e DJANGO_SETTINGS_MODULE=testproject.settings.channels_rabbitmq \
+        -e RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/%2F \
+        py36dj111 \
+        /code/.tox3.6.3/py36-django111/bin/daphne -v 2 testproject.asgi.rabbitmq:channel_layer
+
+    docker-compose run --rm \
+        -e DJANGO_SETTINGS_MODULE=testproject.settings.channels_rabbitmq \
+        -e RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/%2F \
+        py36dj111 \
+        /code/.tox3.6.3/py36-django111/bin/django-admin runworker -v 3
+
+Debugging
+=========
+
+If you have a hard time with understanding what's going on under the
+hood, try ``hunter`` tracing tool::
+
+    PYTHONHUNTER="module='asgi_rabbitmq.core', threading_support=True, actions=[CallPrinter]" daphne testproject.asgi.rabbitmq:channel_layer
+
+Or you can run tests with hunter trace enabled::
+
+    docker-compose run --rm -e PYTHONHUNTER="module__in=['asgi_rabbitmq.core', 'test_unit'], threading_support=True, actions=[CallPrinter]" py36dj111 tox

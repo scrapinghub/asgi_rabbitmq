@@ -4,6 +4,11 @@
 Changelog
 ---------
 
+0.5.5 (2017-12-02)
+++++++++++++++++++
+
+- Pin ``asgiref`` required version to be compatible with ASGI 1.x spec.
+
 0.5.4 (2017-10-22)
 ++++++++++++++++++
 

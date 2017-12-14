@@ -334,8 +334,7 @@ class RabbitmqChannelLayerTest(SetupMixin, RabbitmqLayerTestCaseMixin,
         """
 
         # Wait for connection established.
-        while not self.channel_layer.thread.connection.connection.is_open:
-            time.sleep(0.5)
+        self.channel_layer.thread.connection.is_open.wait()
         name = self.channel_layer.new_channel('foo?')
         # Close connection and wait for it.
         self.channel_layer.thread.connection.connection.close()

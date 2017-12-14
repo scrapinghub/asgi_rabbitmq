@@ -1,6 +1,8 @@
 import base64
 import hashlib
+import logging
 import random
+import time
 from functools import partial
 from string import ascii_letters as ASCII
 
@@ -9,7 +11,11 @@ from asgiref.base_layer import BaseChannelLayer
 from cached_property import threaded_cached_property
 from pika import SelectConnection, URLParameters
 from pika.channel import Channel
-from pika.exceptions import ChannelClosed, ConnectionClosed
+from pika.exceptions import (
+    AMQPConnectionError,
+    ChannelClosed,
+    ConnectionClosed,
+)
 from pika.spec import Basic, BasicProperties
 
 try:
@@ -27,6 +33,8 @@ try:
     TWISTED_AVAILABLE = True
 except ImportError:
     TWISTED_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 SEND = 0
 RECEIVE = 1
@@ -631,13 +639,33 @@ class RabbitmqConnection(object):
         self.get_capacity = get_capacity
         self.crypter = crypter
 
-        # Thread to protocol instance mapping.
-        self.protocols = {}
         # Connection access lock.
         self.lock = Lock()
         # Connection startup event.
         self.is_open = Event()
         self.parameters = self.Parameters(self.url)
+
+    def run(self):
+        """Start connection event loop."""
+
+        while True:
+            try:
+                self.bootstrap_connection()
+                self.connection.ioloop.start()
+            except (AMQPConnectionError, ChannelClosed) as error:
+                logger.info(error)
+                logger.debug(error, exc_info=True)
+                logger.info('Tring to reconnect in 5 seconds')
+                time.sleep(5)
+
+    def bootstrap_connection(self):
+        """Prepare connection state."""
+
+        # Thread to protocol instance mapping.
+        self.protocols = {}
+        # Connection startup event.
+        self.is_open.clear()
+        # Connection object.
         self.connection = self.Connection(
             parameters=self.parameters,
             on_open_callback=self.start_loop,
@@ -646,11 +674,6 @@ class RabbitmqConnection(object):
             stop_ioloop_on_close=False,
             lock=self.lock,
         )
-
-    def run(self):
-        """Start connection event loop."""
-
-        self.connection.ioloop.start()
 
     def start_loop(self, connection):
         """Connection open callback."""
@@ -714,15 +737,6 @@ class RabbitmqConnection(object):
         amqp_channel.on_callback_error_callback = protocol.protocol_error
         return protocol
 
-    def wait_open(self):
-        """Wait for connection to start."""
-
-        if self.connection.is_closing or self.connection.is_closed:
-            raise ConnectionClosed
-        # This method is accessed from other thread.  We must ensure
-        # that connection event loop is ready.
-        self.is_open.wait()
-
     def schedule(self, f, *args, **kwargs):
         """
         Try to acquire connection access lock.  Then call protocol method.
@@ -730,7 +744,13 @@ class RabbitmqConnection(object):
         thread.
         """
 
-        self.wait_open()
+        # This method is accessed from other thread.  We must ensure
+        # that connection event loop is ready.
+        self.is_open.wait()
+        # Connection maybe unset, so it must be checked only after
+        # connection bootstrap process finish.
+        if self.connection.is_closing or self.connection.is_closed:
+            raise ConnectionClosed
         # RabbitMQ operations are multiplexed between different AMQP
         # method callbacks.  Final result of the protocol method call
         # will be set inside one of this callbacks.  So other thread

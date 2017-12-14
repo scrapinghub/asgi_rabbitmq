@@ -24,6 +24,14 @@ To run quick test subset run::
 
     docker-compose run --rm py35dj110 tox -- -m "not slow"
 
+To test local channel layer only run::
+
+    docker-compose run --rm py35dj110 tox -- -m "local"
+
+To run quick test subset for regular channel layer run::
+
+    docker-compose run --rm py35dj110 tox -- -m "not slow and not local"
+
 To rebuild specific test environment run::
 
     docker-compose run --rm py36dj111 tox -r --notest

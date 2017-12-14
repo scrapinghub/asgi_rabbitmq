@@ -550,6 +550,7 @@ class RabbitmqChannelLayerTest(RabbitmqLayerTestCaseMixin, SimpleTestCase,
         assert message is None
 
 
+@pytest.mark.local
 class RabbitmqLocalChannelLayerTest(RabbitmqChannelLayerTest):
 
     channel_layer_cls = RabbitmqLocalChannelLayer

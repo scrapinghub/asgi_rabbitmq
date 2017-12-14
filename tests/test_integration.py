@@ -47,6 +47,8 @@ class IntegrationTest(RabbitmqLayerTestCaseMixin, ChannelLiveServerTestCase):
         assert proc.returncode == 0
 
 
+# FIXME: This will mark all `IntegrationTest` subclasses as `local`.
+@pytest.mark.local
 class LocalIntegrationTest(IntegrationTest):
 
     local = True
@@ -57,6 +59,7 @@ class ConcurrentIntegrationTest(IntegrationTest):
     worker_threads = 4
 
 
+@pytest.mark.local
 class LocalConcurrentIntegrationTest(IntegrationTest):
 
     local = True

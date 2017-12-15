@@ -19,10 +19,16 @@ from channels.test import ChannelTestCase
 from django.test import SimpleTestCase, TestCase
 from msgpack.exceptions import ExtraData
 from pika.exceptions import ConnectionClosed
+from twisted.internet import defer, reactor
+from twisted.trial.unittest import TestCase as TwistedTestCase
 
 
-class RabbitmqChannelLayerTest(RabbitmqLayerTestCaseMixin, SimpleTestCase,
-                               ConformanceTestCase):
+class SetupMixin(object):
+
+    channel_layer_cls = RabbitmqChannelLayer
+    expiry_delay = 1.1
+    capacity_limit = 5
+    heartbeat_interval = 15
 
     def setUp(self):
 
@@ -34,7 +40,7 @@ class RabbitmqChannelLayerTest(RabbitmqLayerTestCaseMixin, SimpleTestCase,
             group_expiry=5,
             capacity=self.capacity_limit,
         )
-        super(RabbitmqChannelLayerTest, self).setUp()
+        super(SetupMixin, self).setUp()
 
     @property
     def defined_exchanges(self):
@@ -58,10 +64,9 @@ class RabbitmqChannelLayerTest(RabbitmqLayerTestCaseMixin, SimpleTestCase,
         queues = queue_definitions[self.virtual_host]
         return queues
 
-    channel_layer_cls = RabbitmqChannelLayer
-    expiry_delay = 1.1
-    capacity_limit = 5
-    heartbeat_interval = 15
+
+class RabbitmqChannelLayerTest(SetupMixin, RabbitmqLayerTestCaseMixin,
+                               SimpleTestCase, ConformanceTestCase):
 
     def test_send_to_empty_group(self):
         """Send to empty group works as usual."""
@@ -623,3 +628,46 @@ class InheritanceTest(TestCase):
         test(result)
         [(_, error)] = result.errors
         assert 'ImproperlyConfigured' in error
+
+
+@pytest.mark.twisted
+class RabbitmqChannelLayerTwistedTest(SetupMixin, RabbitmqLayerTestCaseMixin,
+                                      SimpleTestCase, TwistedTestCase):
+
+    def tearDown(self):
+
+        reactor.removeAll()
+        super(RabbitmqChannelLayerTwistedTest, self).tearDown()
+
+    @defer.inlineCallbacks
+    def test_receive_twisted(self):
+        """Receive with twisted extension."""
+
+        self.channel_layer.send("sr_test", {"value": "blue"})
+        self.channel_layer.send("sr_test", {"value": "green"})
+        self.channel_layer.send("sr_test2", {"value": "red"})
+
+        # Get just one first
+        channel, message = yield self.channel_layer.receive_twisted(
+            ["sr_test"])
+        self.assertEqual(channel, "sr_test")
+        self.assertEqual(message, {"value": "blue"})
+
+        # And the second
+        channel, message = yield self.channel_layer.receive_twisted(
+            ["sr_test"])
+        self.assertEqual(channel, "sr_test")
+        self.assertEqual(message, {"value": "green"})
+
+        # And the other channel with multi select
+        channel, message = yield self.channel_layer.receive_twisted(
+            ["sr_test", "sr_test2"])
+        self.assertEqual(channel, "sr_test2")
+        self.assertEqual(message, {"value": "red"})
+
+
+@pytest.mark.twisted
+@pytest.mark.local
+class RabbitmqLocalChannelLayerTwistedTest(RabbitmqChannelLayerTwistedTest):
+
+    channel_layer_cls = RabbitmqLocalChannelLayer

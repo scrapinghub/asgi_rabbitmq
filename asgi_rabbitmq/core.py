@@ -166,25 +166,24 @@ class Protocol(object):
         if unknown_queues:
             return
         if block:
-            # In blocking mode create consumers in parallel.
-            consumer_tags = {}
-            for channel in channels:
-                tag = self.amqp_channel.basic_consume(
-                    partial(self.consume_message, consumer_tags),
-                    queue=self.get_queue_name(channel),
-                )
-                consumer_tags[tag] = channel
+            self.start_blocking_receive(channels)
         else:
-            # In the non-blocking mode get the message from each queue
-            # in series.
             channels = list(channels)  # Daphne sometimes pass dict.keys()
-            channel = channels[0]
-            no_message = partial(self.no_message, channels[1:])
-            self.amqp_channel.add_callback(no_message, [Basic.GetEmpty])
-            self.amqp_channel.basic_get(
-                partial(self.get_message, channel, no_message),
+            self.start_non_blocking_receive(channels)
+
+    # Blocking receive.
+
+    def start_blocking_receive(self, channels):
+        """Create parallel consumers in one AMQP channel."""
+
+        # In blocking mode create consumers in parallel.
+        consumer_tags = {}
+        for channel in channels:
+            tag = self.amqp_channel.basic_consume(
+                partial(self.consume_message, consumer_tags),
                 queue=self.get_queue_name(channel),
             )
+            consumer_tags[tag] = channel
 
     def consume_message(self, consumer_tags, amqp_channel, method_frame,
                         properties, body):
@@ -199,6 +198,21 @@ class Protocol(object):
             channel = channel + properties.headers['asgi_channel']
         message = self.deserialize(body)
         self.resolve.set_result((channel, message))
+
+    # Non blocking receive.
+
+    def start_non_blocking_receive(self, channels):
+        """Sequentially check each channel queue."""
+
+        # In the non-blocking mode get the message from each queue
+        # in series.
+        channel = channels[0]
+        no_message = partial(self.no_message, channels[1:])
+        self.amqp_channel.add_callback(no_message, [Basic.GetEmpty])
+        self.amqp_channel.basic_get(
+            partial(self.get_message, channel, no_message),
+            queue=self.get_queue_name(channel),
+        )
 
     def get_message(self, channel, no_message, amqp_channel, method_frame,
                     properties, body):
@@ -224,9 +238,7 @@ class Protocol(object):
         """
 
         if channels:
-            # FIXME: Do not declare queues again.  Go to the Basic.Get
-            # operation.
-            self.receive(channels=channels, block=False)
+            self.start_non_blocking_receive(channels)
         else:
             self.resolve.set_result((None, None))
 

@@ -1,7 +1,6 @@
 import base64
 import hashlib
 import random
-import sys
 from functools import partial
 from string import ascii_letters as ASCII
 
@@ -46,13 +45,13 @@ class Protocol(object):
     dead_letters = 'dead-letters'
     """Name of the protocol dead letters exchange and queue."""
 
-    def __init__(self, expiry, group_expiry, get_capacity, ident, crypter):
+    def __init__(self, expiry, group_expiry, get_capacity, crypter, resolve):
 
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.get_capacity = get_capacity
-        self.ident = ident
         self.crypter = crypter
+        self.resolve = resolve
         # Mapping for the connection schedule method.
         self.methods = {
             SEND: self.send,
@@ -696,29 +695,42 @@ class RabbitmqConnection(object):
         # Start new AMQP channel for it and wrap it into protocol
         # instance.  Protocol method will be called as channel open
         # callback.
+        protocol = self.open_amqp_channel(method, future)
+        # Remember protocol for future use.
+        self.protocols[ident] = protocol
+
+    def open_amqp_channel(self, method, future):
+        """
+        Open new AMQP Channel and associate new `Protocol` instance with
+        it.
+        """
+
         protocol = self.Protocol(self.expiry, self.group_expiry,
-                                 self.get_capacity, ident, self.crypter)
-        protocol.resolve = future
+                                 self.get_capacity, self.crypter, future)
         amqp_channel = self.connection.channel(
             partial(protocol.register_channel, method),
         )
         # Handle AMQP channel level errors with protocol.
         amqp_channel.on_callback_error_callback = protocol.protocol_error
-        # Remember protocol for future use.
-        self.protocols[ident] = protocol
+        return protocol
 
-    def schedule(self, ident, f, *args, **kwargs):
-        """
-        Try to acquire connection access lock.  Then call protocol method.
-        Return concurrent Future instance you can wait in the other
-        thread.
-        """
+    def wait_open(self):
+        """Wait for connection to start."""
 
         if self.connection.is_closing or self.connection.is_closed:
             raise ConnectionClosed
         # This method is accessed from other thread.  We must ensure
         # that connection event loop is ready.
         self.is_open.wait()
+
+    def schedule(self, f, *args, **kwargs):
+        """
+        Try to acquire connection access lock.  Then call protocol method.
+        Return concurrent Future instance you can wait in the other
+        thread.
+        """
+
+        self.wait_open()
         # RabbitMQ operations are multiplexed between different AMQP
         # method callbacks.  Final result of the protocol method call
         # will be set inside one of this callbacks.  So other thread
@@ -726,7 +738,7 @@ class RabbitmqConnection(object):
         # connection event loop.
         future = Future()
         with self.lock:
-            self.process(ident, (f, args, kwargs), future)
+            self.process(get_ident(), (f, args, kwargs), future)
         return future
 
     @property
@@ -737,6 +749,18 @@ class RabbitmqConnection(object):
         """
 
         return self.protocols[get_ident()]
+
+    def twisted_schedule(self, f, *args, **kwargs):
+        """
+        Try to acquire connection access lock.  Then create new protocol
+        instance for one Twisted deferred object resolution.
+        """
+
+        self.wait_open()
+        future = Future()
+        with self.lock:
+            self.open_amqp_channel((f, args, kwargs), future)
+        return future
 
 
 class ConnectionThread(Thread):
@@ -760,13 +784,13 @@ class ConnectionThread(Thread):
 
         self.connection.run()
 
-    def threading_schedule(self, f, *args, **kwargs):
+    def schedule(self, f, *args, **kwargs):
         """
         Schedule protocol method execution in the context of the
         connection thread.
         """
 
-        return self.connection.schedule(get_ident(), f, *args, **kwargs)
+        return self.connection.schedule(f, *args, **kwargs)
 
     def twisted_schedule(self, f, *args, **kwargs):
         """
@@ -776,8 +800,7 @@ class ConnectionThread(Thread):
         """
 
         # FIXME: Close AMQP channels opened by twisted.
-        return self.connection.schedule(
-            random.randrange(sys.maxsize), f, *args, **kwargs)
+        return self.connection.twisted_schedule(f, *args, **kwargs)
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):
@@ -846,7 +869,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Send the message to the channel."""
 
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.threading_schedule(SEND, channel, message)
+        future = self.thread.schedule(SEND, channel, message)
         return future.result()
 
     def receive(self, channels, block=False):
@@ -855,7 +878,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         for channel in channels:
             fail_msg = 'Channel name %s is not valid' % channel
             assert self.valid_channel_name(channel, receive=True), fail_msg
-        future = self.thread.threading_schedule(RECEIVE, channels, block)
+        future = self.thread.schedule(RECEIVE, channels, block)
         return future.result()
 
     def new_channel(self, pattern):
@@ -864,7 +887,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert pattern.endswith('?')
         random_string = "".join(random.choice(ASCII) for i in range(20))
         new_name = pattern + random_string
-        future = self.thread.threading_schedule(NEW_CHANNEL, new_name)
+        future = self.thread.schedule(NEW_CHANNEL, new_name)
         future.result()
         return new_name
 
@@ -873,7 +896,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.threading_schedule(GROUP_ADD, group, channel)
+        future = self.thread.schedule(GROUP_ADD, group, channel)
         return future.result()
 
     def group_discard(self, group, channel):
@@ -881,14 +904,14 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.threading_schedule(GROUP_DISCARD, group, channel)
+        future = self.thread.schedule(GROUP_DISCARD, group, channel)
         return future.result()
 
     def send_group(self, group, message):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
-        future = self.thread.threading_schedule(SEND_GROUP, group, message)
+        future = self.thread.schedule(SEND_GROUP, group, message)
         try:
             return future.result()
         except ChannelClosed:

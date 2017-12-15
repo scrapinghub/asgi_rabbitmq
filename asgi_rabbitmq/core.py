@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import random
+import sys
 from functools import partial
 from string import ascii_letters as ASCII
 
@@ -22,6 +23,12 @@ try:
 except ImportError:
     from threading import Thread, Lock, Event, _get_ident as get_ident
 
+try:
+    from twisted.internet import defer, reactor
+    TWISTED_AVAILABLE = True
+except ImportError:
+    TWISTED_AVAILABLE = False
+
 SEND = 0
 RECEIVE = 1
 NEW_CHANNEL = 2
@@ -30,6 +37,7 @@ GROUP_DISCARD = 4
 SEND_GROUP = 5
 DECLARE_DEAD_LETTERS = 6
 EXPIRE_GROUP_MEMBER = 7
+RECEIVE_TWISTED = 8
 
 
 class Protocol(object):
@@ -55,6 +63,7 @@ class Protocol(object):
             SEND_GROUP: self.send_group,
             DECLARE_DEAD_LETTERS: self.declare_dead_letters,
             EXPIRE_GROUP_MEMBER: self.expire_group_member,
+            RECEIVE_TWISTED: self.receive_twisted,
         }
 
     # Utilities.
@@ -250,6 +259,12 @@ class Protocol(object):
             'x-dead-letter-exchange': self.dead_letters,
             'x-expires': self.expiry * 2000,
         }
+
+    # Twisted receive.
+
+    def receive_twisted(self, channels):
+
+        self.receive(channels, block=True)
 
     # New channel.
 
@@ -692,7 +707,7 @@ class RabbitmqConnection(object):
         # Remember protocol for future use.
         self.protocols[ident] = protocol
 
-    def schedule(self, f, *args, **kwargs):
+    def schedule(self, ident, f, *args, **kwargs):
         """
         Try to acquire connection access lock.  Then call protocol method.
         Return concurrent Future instance you can wait in the other
@@ -711,7 +726,7 @@ class RabbitmqConnection(object):
         # connection event loop.
         future = Future()
         with self.lock:
-            self.process(get_ident(), (f, args, kwargs), future)
+            self.process(ident, (f, args, kwargs), future)
         return future
 
     @property
@@ -745,13 +760,24 @@ class ConnectionThread(Thread):
 
         self.connection.run()
 
-    def schedule(self, f, *args, **kwargs):
+    def threading_schedule(self, f, *args, **kwargs):
         """
         Schedule protocol method execution in the context of the
         connection thread.
         """
 
-        return self.connection.schedule(f, *args, **kwargs)
+        return self.connection.schedule(get_ident(), f, *args, **kwargs)
+
+    def twisted_schedule(self, f, *args, **kwargs):
+        """
+        Schedule protocol method execution in the context of the
+        connection thread which will resolve twisted deferred object
+        in the end.
+        """
+
+        # FIXME: Close AMQP channels opened by twisted.
+        return self.connection.schedule(
+            random.randrange(sys.maxsize), f, *args, **kwargs)
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):
@@ -820,7 +846,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Send the message to the channel."""
 
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.schedule(SEND, channel, message)
+        future = self.thread.threading_schedule(SEND, channel, message)
         return future.result()
 
     def receive(self, channels, block=False):
@@ -829,7 +855,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         for channel in channels:
             fail_msg = 'Channel name %s is not valid' % channel
             assert self.valid_channel_name(channel, receive=True), fail_msg
-        future = self.thread.schedule(RECEIVE, channels, block)
+        future = self.thread.threading_schedule(RECEIVE, channels, block)
         return future.result()
 
     def new_channel(self, pattern):
@@ -838,7 +864,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert pattern.endswith('?')
         random_string = "".join(random.choice(ASCII) for i in range(20))
         new_name = pattern + random_string
-        future = self.thread.schedule(NEW_CHANNEL, new_name)
+        future = self.thread.threading_schedule(NEW_CHANNEL, new_name)
         future.result()
         return new_name
 
@@ -847,7 +873,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.schedule(GROUP_ADD, group, channel)
+        future = self.thread.threading_schedule(GROUP_ADD, group, channel)
         return future.result()
 
     def group_discard(self, group, channel):
@@ -855,14 +881,14 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.schedule(GROUP_DISCARD, group, channel)
+        future = self.thread.threading_schedule(GROUP_DISCARD, group, channel)
         return future.result()
 
     def send_group(self, group, message):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
-        future = self.thread.schedule(SEND_GROUP, group, message)
+        future = self.thread.threading_schedule(SEND_GROUP, group, message)
         try:
             return future.result()
         except ChannelClosed:
@@ -870,6 +896,24 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             # does not exist yet.  This mean no one call `group_add`
             # yet, so group is empty and we should not worry about.
             pass
+
+    if TWISTED_AVAILABLE:
+
+        extensions.append('twisted')
+
+        @defer.inlineCallbacks
+        def receive_twisted(self, channels):
+            """Twisted-native implementation of receive."""
+
+            deferred = defer.Deferred()
+
+            def resolve_deferred(future):
+
+                reactor.callFromThread(deferred.callback, future.result())
+
+            future = self.thread.twisted_schedule(RECEIVE_TWISTED, channels)
+            future.add_done_callback(resolve_deferred)
+            defer.returnValue((yield deferred))
 
 
 # TODO: Is it optimal to read bytes from content frame, call python

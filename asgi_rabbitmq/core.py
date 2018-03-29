@@ -679,7 +679,11 @@ class RabbitmqConnection(object):
         about connection state, then teardown event loop or try to reconnect.
         """
 
-        self.protocol_error(ConnectionClosed())
+        try:
+            self.protocol_error(ConnectionClosed())
+        except:
+            logger.warning('Exception when notifying threads about closed '
+                           'connection', exc_info=True)
         if self.connection.is_closing:
             self.connection.ioloop.stop()
         else:

@@ -68,6 +68,7 @@ class Protocol(object):
             EXPIRE_GROUP_MEMBER: self.expire_group_member,
             RECEIVE_TWISTED: self.receive_twisted,
         }
+        self.are_confirmations_enabled = False
 
     # Utilities.
 
@@ -78,7 +79,6 @@ class Protocol(object):
         """
 
         self.amqp_channel = amqp_channel
-        self.amqp_channel.confirm_delivery(self.on_delivery_confirmation)
         self.apply(*method)
 
     def apply(self, method_id, args, kwargs):
@@ -125,7 +125,10 @@ class Protocol(object):
 
     def publish_message(self, channel, body):
         """Channel capacity check is done.  Publish message."""
-
+        # enable delivery confirmations once on first message
+        if not self.are_confirmations_enabled:
+            self.amqp_channel.confirm_delivery(self.on_delivery_confirmation)
+            self.are_confirmations_enabled = True
         queue = self.get_queue_name(channel)
         self.amqp_channel.basic_publish(
             exchange='',

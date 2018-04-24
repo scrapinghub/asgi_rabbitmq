@@ -78,6 +78,7 @@ class Protocol(object):
         """
 
         self.amqp_channel = amqp_channel
+        self.amqp_channel.confirm_delivery(self.on_delivery_confirmation)
         self.apply(*method)
 
     def apply(self, method_id, args, kwargs):
@@ -125,7 +126,6 @@ class Protocol(object):
     def publish_message(self, channel, body):
         """Channel capacity check is done.  Publish message."""
 
-        self.amqp_channel.confirm_delivery(self.on_delivery_confirmation)
         queue = self.get_queue_name(channel)
         self.amqp_channel.basic_publish(
             exchange='',

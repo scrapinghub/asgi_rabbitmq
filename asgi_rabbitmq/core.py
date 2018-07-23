@@ -26,7 +26,27 @@ except ImportError:
 
 try:
     from twisted.internet import defer, reactor
+    from twisted.python import failure
     TWISTED_AVAILABLE = True
+
+    def deferred_from_future(future):
+        deferred = defer.Deferred()
+
+        def resolve_deferred(future):
+            try:
+                result = future.result()
+            except:
+                result = failure.Failure()
+            reactor.callFromThread(deferred.callback, result)
+
+        future.add_done_callback(resolve_deferred)
+        return deferred
+
+    def deferred_sleep(delay):
+        deferred = defer.Deferred()
+        reactor.callLater(delay, deferred.callback, None)
+        return deferred
+
 except ImportError:
     TWISTED_AVAILABLE = False
 
@@ -968,16 +988,17 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         def receive_twisted(self, channels):
             """Twisted-native implementation of receive."""
 
-            deferred = defer.Deferred()
-
-            def resolve_deferred(future):
-
-                reactor.callFromThread(deferred.callback, future.result())
-
-            future = self.thread.schedule(RECEIVE, channels, block=True)
-            future.add_done_callback(resolve_deferred)
-            defer.returnValue((yield deferred))
-
+            while True:
+                try:
+                    result = yield deferred_from_future(
+                        self.thread.schedule(RECEIVE, channels, block=True)
+                    )
+                    defer.returnValue(result)
+                except ConnectionClosed:
+                    delay = self.thread.connection.parameters.retry_delay
+                    logger.warning(
+                        'Disconnected, retrying after %s seconds', delay)
+                    yield deferred_sleep(delay)
 
 # TODO: Is it optimal to read bytes from content frame, call python
 # decode method to convert it to string and than parse it with

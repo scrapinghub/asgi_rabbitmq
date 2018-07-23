@@ -787,13 +787,7 @@ class RabbitmqConnection(object):
         thread.
         """
 
-        # This method is accessed from other thread.  We must ensure
-        # that connection event loop is ready.
         self.wait_open()
-        # Connection maybe unset, so it must be checked only after
-        # connection bootstrap process finish.
-        if self.connection.is_closing or self.connection.is_closed:
-            raise ConnectionClosed
         # RabbitMQ operations are multiplexed between different AMQP
         # method callbacks.  Final result of the protocol method call
         # will be set inside one of this callbacks.  So other thread

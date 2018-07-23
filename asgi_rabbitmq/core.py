@@ -40,7 +40,6 @@ GROUP_DISCARD = 4
 SEND_GROUP = 5
 DECLARE_DEAD_LETTERS = 6
 EXPIRE_GROUP_MEMBER = 7
-RECEIVE_TWISTED = 8
 
 
 class Protocol(object):
@@ -50,12 +49,11 @@ class Protocol(object):
     """Name of the protocol dead letters exchange and queue."""
 
     def __init__(self, channel_factory, expiry, group_expiry, get_capacity,
-                 crypter, auto_close=False):
+                 crypter):
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.get_capacity = get_capacity
         self.crypter = crypter
-        self.auto_close = auto_close
         # Mapping for the connection schedule method.
         self.methods = {
             SEND: self.send,
@@ -65,7 +63,6 @@ class Protocol(object):
             GROUP_DISCARD: self.group_discard,
             SEND_GROUP: self.send_group,
             DECLARE_DEAD_LETTERS: self.declare_dead_letters,
-            RECEIVE_TWISTED: self.receive_twisted,
         }
         self.waiting_calls = []
         self.messages = {}
@@ -83,10 +80,6 @@ class Protocol(object):
         """Take method from the mapping and call it."""
 
         if self.is_open:
-            if self.auto_close:
-                future.add_done_callback(
-                    lambda method_frame: self.amqp_channel.close(),
-                )
             self.methods[method_id](future, *args, **kwargs)
         else:
             self.waiting_calls.append((method_id, args, kwargs, future))
@@ -312,12 +305,6 @@ class Protocol(object):
             'x-dead-letter-exchange': self.dead_letters,
             'x-expires': self.expiry * 2000,
         }
-
-    # Twisted receive.
-
-    def receive_twisted(self, future, channels):
-
-        self.receive(future, channels, block=True)
 
     # New channel.
 
@@ -771,25 +758,16 @@ class RabbitmqConnection(object):
             # Start new AMQP channel for it and wrap it into protocol
             # instance.  Protocol method will be called as channel open
             # callback.
-            self.protocols[ident] = self.open_amqp_channel()
+            self.protocols[ident] = self.Protocol(
+                channel_factory=self.connection.channel,
+                expiry=self.expiry,
+                group_expiry=self.group_expiry,
+                get_capacity=self.get_capacity,
+                crypter=self.crypter,
+            )
         # We have running AMQP channel for current given thread.
         # Apply protocol method directly.
         self.protocols[ident].apply(*method)
-
-    def open_amqp_channel(self, single_use=False):
-        """
-        Open new AMQP Channel and associate new `Protocol` instance with
-        it.
-        """
-
-        return self.Protocol(
-            channel_factory=self.connection.channel,
-            expiry=self.expiry,
-            group_expiry=self.group_expiry,
-            get_capacity=self.get_capacity,
-            crypter=self.crypter,
-            auto_close=single_use,
-        )
 
     def wait_open(self):
         """Wait for connection to start."""
@@ -827,19 +805,6 @@ class RabbitmqConnection(object):
 
         return self.protocols[get_ident()]
 
-    def twisted_schedule(self, f, *args, **kwargs):
-        """
-        Try to acquire connection access lock.  Then create new protocol
-        instance for one Twisted deferred object resolution.
-        """
-
-        self.wait_open()
-        future = Future()
-        with self.lock:
-            protocol = self.open_amqp_channel(single_use=True)
-            protocol.apply(f, args, kwargs, future)
-        return future
-
 
 class ConnectionThread(Thread):
     """
@@ -869,15 +834,6 @@ class ConnectionThread(Thread):
         """
 
         return self.connection.schedule(f, *args, **kwargs)
-
-    def twisted_schedule(self, f, *args, **kwargs):
-        """
-        Schedule protocol method execution in the context of the
-        connection thread which will resolve twisted deferred object
-        in the end.
-        """
-
-        return self.connection.twisted_schedule(f, *args, **kwargs)
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):
@@ -1018,7 +974,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
                 reactor.callFromThread(deferred.callback, future.result())
 
-            future = self.thread.twisted_schedule(RECEIVE_TWISTED, channels)
+            future = self.thread.schedule(RECEIVE, channels, block=True)
             future.add_done_callback(resolve_deferred)
             defer.returnValue((yield deferred))
 

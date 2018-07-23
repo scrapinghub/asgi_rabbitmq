@@ -49,11 +49,13 @@ class Protocol(object):
     dead_letters = 'dead-letters'
     """Name of the protocol dead letters exchange and queue."""
 
-    def __init__(self, expiry, group_expiry, get_capacity, crypter):
+    def __init__(self, channel_factory, expiry, group_expiry, get_capacity,
+                 crypter, auto_close=False):
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.get_capacity = get_capacity
         self.crypter = crypter
+        self.auto_close = auto_close
         # Mapping for the connection schedule method.
         self.methods = {
             SEND: self.send,
@@ -65,26 +67,35 @@ class Protocol(object):
             DECLARE_DEAD_LETTERS: self.declare_dead_letters,
             RECEIVE_TWISTED: self.receive_twisted,
         }
+        self.waiting_calls = []
         self.messages = {}
         self.message_number = 0
         self.confirmed_message_number = -1
         self.are_confirmations_enabled = False
 
+        self.amqp_channel = channel_factory(self.apply_waiting)
+        # Handle AMQP channel level errors with protocol.
+        self.amqp_channel.on_callback_error_callback = self.protocol_error
+
     # Utilities.
-
-    def register_channel(self, method, amqp_channel):
-        """
-        Assign open AMQP channel to this protocol instance.  Call passed
-        method afterwards.  Used as AMQP channel open callback mostly.
-        """
-
-        self.amqp_channel = amqp_channel
-        self.apply(*method)
 
     def apply(self, method_id, args, kwargs, future):
         """Take method from the mapping and call it."""
 
-        self.methods[method_id](future, *args, **kwargs)
+        if self.is_open:
+            if self.auto_close:
+                future.add_done_callback(
+                    lambda method_frame: self.amqp_channel.close(),
+                )
+            self.methods[method_id](future, *args, **kwargs)
+        else:
+            self.waiting_calls.append((method_id, args, kwargs, future))
+
+    def apply_waiting(self, unused_channel):
+        if self.is_open:
+            for call in self.waiting_calls:
+                self.apply(*call)
+            self.waiting_calls.clear()
 
     def protocol_error(self, error):
         """
@@ -102,6 +113,14 @@ class Protocol(object):
             return channel[:channel.rfind('!') + 1]
         else:
             return channel
+
+    @property
+    def is_open(self):
+        return self.amqp_channel.is_open
+
+    @property
+    def is_closed(self):
+        return self.amqp_channel.is_closing or self.amqp_channel.is_closed
 
     # Send.
 
@@ -747,37 +766,30 @@ class RabbitmqConnection(object):
         one if necessary.
         """
 
-        if (ident in self.protocols and
-                self.protocols[ident].amqp_channel.is_open):
-            # We have running AMQP channel for current given thread.
-            # Apply protocol method directly.
-            self.protocols[ident].apply(*method)
-            return
-        # Given thread doesn't have corresponding protocol instance.
-        # Start new AMQP channel for it and wrap it into protocol
-        # instance.  Protocol method will be called as channel open
-        # callback.
-        protocol = self.open_amqp_channel(method)
-        # Remember protocol for future use.
-        self.protocols[ident] = protocol
+        if ident not in self.protocols or self.protocols[ident].is_closed:
+            # Given thread doesn't have corresponding protocol instance.
+            # Start new AMQP channel for it and wrap it into protocol
+            # instance.  Protocol method will be called as channel open
+            # callback.
+            self.protocols[ident] = self.open_amqp_channel()
+        # We have running AMQP channel for current given thread.
+        # Apply protocol method directly.
+        self.protocols[ident].apply(*method)
 
-    def open_amqp_channel(self, method, single_use=False):
+    def open_amqp_channel(self, single_use=False):
         """
         Open new AMQP Channel and associate new `Protocol` instance with
         it.
         """
 
-        protocol = self.Protocol(self.expiry, self.group_expiry,
-                                 self.get_capacity, self.crypter)
-        amqp_channel = self.connection.channel(
-            partial(protocol.register_channel, method)
+        return self.Protocol(
+            channel_factory=self.connection.channel,
+            expiry=self.expiry,
+            group_expiry=self.group_expiry,
+            get_capacity=self.get_capacity,
+            crypter=self.crypter,
+            auto_close=single_use,
         )
-        # Handle AMQP channel level errors with protocol.
-        amqp_channel.on_callback_error_callback = protocol.protocol_error
-        if single_use:
-            future = method[-1]
-            future.add_done_callback(lambda method_frame: amqp_channel.close())
-        return protocol
 
     def wait_open(self):
         """Wait for connection to start."""
@@ -824,7 +836,8 @@ class RabbitmqConnection(object):
         self.wait_open()
         future = Future()
         with self.lock:
-            self.open_amqp_channel((f, args, kwargs, future), single_use=True)
+            protocol = self.open_amqp_channel(single_use=True)
+            protocol.apply(f, args, kwargs, future)
         return future
 
 

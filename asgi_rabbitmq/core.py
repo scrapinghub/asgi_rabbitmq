@@ -49,13 +49,11 @@ class Protocol(object):
     dead_letters = 'dead-letters'
     """Name of the protocol dead letters exchange and queue."""
 
-    def __init__(self, expiry, group_expiry, get_capacity, crypter, resolve):
-
+    def __init__(self, expiry, group_expiry, get_capacity, crypter):
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.get_capacity = get_capacity
         self.crypter = crypter
-        self.resolve = resolve
         # Mapping for the connection schedule method.
         self.methods = {
             SEND: self.send,
@@ -65,9 +63,11 @@ class Protocol(object):
             GROUP_DISCARD: self.group_discard,
             SEND_GROUP: self.send_group,
             DECLARE_DEAD_LETTERS: self.declare_dead_letters,
-            EXPIRE_GROUP_MEMBER: self.expire_group_member,
             RECEIVE_TWISTED: self.receive_twisted,
         }
+        self.messages = {}
+        self.message_number = 0
+        self.confirmed_message_number = -1
         self.are_confirmations_enabled = False
 
     # Utilities.
@@ -81,10 +81,10 @@ class Protocol(object):
         self.amqp_channel = amqp_channel
         self.apply(*method)
 
-    def apply(self, method_id, args, kwargs):
+    def apply(self, method_id, args, kwargs, future):
         """Take method from the mapping and call it."""
 
-        self.methods[method_id](*args, **kwargs)
+        self.methods[method_id](future, *args, **kwargs)
 
     def protocol_error(self, error):
         """
@@ -92,7 +92,8 @@ class Protocol(object):
         thread.
         """
 
-        self.resolve.set_exception(error)
+        for future in self.messages.values():
+            future.set_exception(error)
 
     def get_queue_name(self, channel):
         """Translate ASGI channel name to the RabbitMQ queue name."""
@@ -104,41 +105,57 @@ class Protocol(object):
 
     # Send.
 
-    def send(self, channel, message):
+    def send(self, future, channel, message):
         """Start message sending.  Declare necessary queue first."""
 
         queue = self.get_queue_name(channel)
         self.amqp_channel.queue_declare(
-            partial(self.handle_publish, channel, message),
+            partial(self.handle_publish, future, channel, message),
             queue=queue,
             arguments=self.queue_arguments,
         )
 
-    def handle_publish(self, channel, message, method_frame):
+    def handle_publish(self, future, channel, message, method_frame):
         """Queue declared.  Check channel capacity."""
 
         if method_frame.method.message_count >= self.get_capacity(channel):
-            self.resolve.set_exception(RabbitmqChannelLayer.ChannelFull())
+            future.set_exception(RabbitmqChannelLayer.ChannelFull())
             return
         body = self.serialize(message)
-        self.publish_message(channel, body)
+        self.publish_message(future, channel, body)
 
-    def publish_message(self, channel, body):
+    def publish_message(self, future, channel, body):
         """Channel capacity check is done.  Publish message."""
-        # enable delivery confirmations once on first message
-        if not self.are_confirmations_enabled:
-            self.amqp_channel.confirm_delivery(self.on_delivery_confirmation)
-            self.are_confirmations_enabled = True
         queue = self.get_queue_name(channel)
-        self.amqp_channel.basic_publish(
+        self.basic_publish(
+            future,
             exchange='',
             routing_key=queue,
             body=body,
             properties=self.publish_properties(channel),
         )
 
+    def basic_publish(self, future, **kwargs):
+        self.message_number += 1
+        if future is not None:
+            self.messages[self.message_number] = future
+        # enable delivery confirmations once on first message
+        if not self.are_confirmations_enabled:
+            self.amqp_channel.confirm_delivery(self.on_delivery_confirmation)
+            self.are_confirmations_enabled = True
+        self.amqp_channel.basic_publish(mandatory=True, **kwargs)
+
     def on_delivery_confirmation(self, frame):
-        self.resolve.set_result(None)
+        for message_number in range(
+            (self.confirmed_message_number + 1
+             if frame.method.multiple
+             else frame.method.delivery_tag),
+            frame.method.delivery_tag + 1,
+        ):
+            future = self.messages.pop(message_number, None)
+            if future is not None:
+                future.set_result(None)
+        self.confirmed_message_number = frame.method.delivery_tag
 
     def publish_properties(self, channel=None):
         """AMQP message properties."""
@@ -156,14 +173,14 @@ class Protocol(object):
 
     # Receive.
 
-    def receive(self, channels, block):
+    def receive(self, future, channels, block):
         """Initiate message receive."""
 
         # Declare necessary queues in parallel.
         queues = set(map(self.get_queue_name, channels))
         known_queues = set()
-        queues_declared = partial(self.queues_declared, queues, known_queues,
-                                  channels, block)
+        queues_declared = partial(self.queues_declared, future, queues,
+                                  known_queues, channels, block)
         for queue in queues:
             self.amqp_channel.queue_declare(
                 queues_declared,
@@ -171,7 +188,7 @@ class Protocol(object):
                 arguments=self.queue_arguments,
             )
 
-    def queues_declared(self, queues, known_queues, channels, block,
+    def queues_declared(self, future, queues, known_queues, channels, block,
                         method_frame):
         """One queue was declared.  Continue if it was the last one."""
 
@@ -184,27 +201,27 @@ class Protocol(object):
         if unknown_queues:
             return
         if block:
-            self.start_blocking_receive(channels)
+            self.start_blocking_receive(future, channels)
         else:
             channels = list(channels)  # Daphne sometimes pass dict.keys()
-            self.start_non_blocking_receive(channels)
+            self.start_non_blocking_receive(future, channels)
 
     # Blocking receive.
 
-    def start_blocking_receive(self, channels):
+    def start_blocking_receive(self, future, channels):
         """Create parallel consumers in one AMQP channel."""
 
         # In blocking mode create consumers in parallel.
         consumer_tags = {}
         for channel in channels:
             tag = self.amqp_channel.basic_consume(
-                partial(self.consume_message, consumer_tags),
+                partial(self.consume_message, future, consumer_tags),
                 queue=self.get_queue_name(channel),
             )
             consumer_tags[tag] = channel
 
-    def consume_message(self, consumer_tags, amqp_channel, method_frame,
-                        properties, body):
+    def consume_message(self, future, consumer_tags, amqp_channel,
+                        method_frame, properties, body):
 
         amqp_channel.basic_ack(method_frame.delivery_tag)
         # Cancel parallel consumers.
@@ -215,25 +232,25 @@ class Protocol(object):
         if properties.headers and 'asgi_channel' in properties.headers:
             channel = channel + properties.headers['asgi_channel']
         message = self.deserialize(body)
-        self.resolve.set_result((channel, message))
+        future.set_result((channel, message))
 
     # Non blocking receive.
 
-    def start_non_blocking_receive(self, channels):
+    def start_non_blocking_receive(self, future, channels):
         """Sequentially check each channel queue."""
 
         # In the non-blocking mode get the message from each queue
         # in series.
         channel = channels[0]
-        no_message = partial(self.no_message, channels[1:])
+        no_message = partial(self.no_message, future, channels[1:])
         self.amqp_channel.add_callback(no_message, [Basic.GetEmpty])
         self.amqp_channel.basic_get(
-            partial(self.get_message, channel, no_message),
+            partial(self.get_message, future, channel, no_message),
             queue=self.get_queue_name(channel),
         )
 
-    def get_message(self, channel, no_message, amqp_channel, method_frame,
-                    properties, body):
+    def get_message(self, future, channel, no_message, amqp_channel,
+                    method_frame, properties, body):
         """Message was received in the non-blocking mode."""
 
         # Cancel no message callback for this queue.
@@ -247,18 +264,18 @@ class Protocol(object):
         if properties.headers and 'asgi_channel' in properties.headers:
             channel = channel + properties.headers['asgi_channel']
         message = self.deserialize(body)
-        self.resolve.set_result((channel, message))
+        future.set_result((channel, message))
 
-    def no_message(self, channels, method_frame):
+    def no_message(self, future, channels, method_frame):
         """
         The queue is empty.  Tries to read from next channel in
         non-blocking mode.
         """
 
         if channels:
-            self.start_non_blocking_receive(channels)
+            self.start_non_blocking_receive(future, channels)
         else:
-            self.resolve.set_result((None, None))
+            future.set_result((None, None))
 
     @property
     def queue_arguments(self):
@@ -271,37 +288,36 @@ class Protocol(object):
 
     # Twisted receive.
 
-    def receive_twisted(self, channels):
+    def receive_twisted(self, future, channels):
 
-        self.receive(channels, block=True)
+        self.receive(future, channels, block=True)
 
     # New channel.
 
-    def new_channel(self, new_name):
+    def new_channel(self, future, new_name):
         """Initiate new single reader channel creation."""
 
         self.amqp_channel.queue_declare(
-            self.new_channel_declared,
+            partial(self.new_channel_declared, future),
             queue=new_name,
             arguments=self.queue_arguments,
         )
 
-    def new_channel_declared(self, method_frame):
+    def new_channel_declared(self, future, method_frame):
         """Notify waiting thread new single reader channel was created."""
 
-        self.resolve.set_result(None)
+        future.set_result(None)
 
     # Groups.
 
-    def group_add(self, group, channel):
+    def group_add(self, future, group, channel):
         """Initiate member addition to the group."""
 
         self.expire_group_member(group, channel)
 
         # The last callback.
         def after_bind(method_frame):
-
-            self.resolve.set_result(None)
+            future.set_result(None)
 
         if '!' in channel:
             # Process local channels needs its own queue for
@@ -376,45 +392,49 @@ class Protocol(object):
             exchange_type='fanout',
         )
 
-    def group_discard(self, group, channel):
+    def group_discard(self, future, group, channel):
         """Initiate member removing from the group."""
+
+        def after_unbind(method_frame):
+            if future is not None:
+                future.set_result(None)
 
         if '!' in channel:
             self.amqp_channel.queue_unbind(
-                lambda method_frame: self.resolve.set_result(None),
+                after_unbind,
                 queue=channel,
                 exchange=group,
             )
         else:
             self.amqp_channel.exchange_unbind(
-                lambda method_frame: self.resolve.set_result(None),
+                after_unbind,
                 destination=channel,
                 source=group,
             )
 
-    def send_group(self, group, message):
+    def send_group(self, future, group, message):
         """
         Declare group exchange.  Pass execution to the group declared
         callback.
         """
 
         self.amqp_channel.exchange_declare(
-            partial(self.group_declared, group, message),
+            partial(self.group_declared, future, group, message),
             exchange=group,
             exchange_type='fanout',
         )
 
-    def group_declared(self, group, message, method_frame):
+    def group_declared(self, future, group, message, method_frame):
         """Publish the message to the group exchange."""
 
         body = self.serialize(message)
-        self.amqp_channel.basic_publish(
+        self.basic_publish(
+            future,
             exchange=group,
             routing_key='',
             body=body,
             properties=self.publish_properties(),
         )
-        self.resolve.set_result(None)
 
     # Dead letters processing.
 
@@ -444,7 +464,8 @@ class Protocol(object):
             'group': group,
             'channel': channel,
         })
-        self.amqp_channel.basic_publish(
+        self.basic_publish(
+            None,
             exchange='',
             routing_key=self.get_expire_marker(group, channel),
             body=body,
@@ -455,7 +476,7 @@ class Protocol(object):
 
         return 'expire.bind.%s.%s' % (group, channel)
 
-    def declare_dead_letters(self):
+    def declare_dead_letters(self, future):
         """
         Initiate dead letters processing.  Declare dead letters exchange
         and queue.  Bind them together.  Start dead letter consumer.
@@ -501,7 +522,7 @@ class Protocol(object):
             message = self.deserialize(body)
             group = message['group']
             channel = message['channel']
-            self.group_discard(group, channel)
+            self.group_discard(None, group, channel)
         elif reason == 'expired' and not self.is_expire_marker(queue):
             # The message was expired in the channel.  Discard all
             # group membership for this channel.
@@ -516,7 +537,7 @@ class Protocol(object):
         elif reason == 'maxlen' and '!' in queue:
             # Send group method was applied to the process local
             # channel.  Redeliver message to the right queue.
-            self.publish_message(queue, body)
+            self.publish_message(None, queue, body)
 
     def is_expire_marker(self, queue):
         """Check if the queue is an expiration marker."""
@@ -674,7 +695,7 @@ class RabbitmqConnection(object):
         """Connection open callback."""
 
         self.is_open.set()
-        self.process(None, (DECLARE_DEAD_LETTERS, (), {}), Future())
+        self.process(None, (DECLARE_DEAD_LETTERS, (), {}, Future()))
 
     def on_connection_closed(self, connection, code, msg):
         """
@@ -710,9 +731,9 @@ class RabbitmqConnection(object):
         """
 
         for protocol in self.protocols.values():
-            protocol.resolve.set_exception(error)
+            protocol.protocol_error(error)
 
-    def process(self, ident, method, future):
+    def process(self, ident, method):
         """
         Apply protocol method to the existed protocol instance.  Create
         one if necessary.
@@ -722,27 +743,26 @@ class RabbitmqConnection(object):
                 self.protocols[ident].amqp_channel.is_open):
             # We have running AMQP channel for current given thread.
             # Apply protocol method directly.
-            self.protocols[ident].resolve = future
             self.protocols[ident].apply(*method)
             return
         # Given thread doesn't have corresponding protocol instance.
         # Start new AMQP channel for it and wrap it into protocol
         # instance.  Protocol method will be called as channel open
         # callback.
-        protocol = self.open_amqp_channel(method, future)
+        protocol = self.open_amqp_channel(method)
         # Remember protocol for future use.
         self.protocols[ident] = protocol
 
-    def open_amqp_channel(self, method, future):
+    def open_amqp_channel(self, method):
         """
         Open new AMQP Channel and associate new `Protocol` instance with
         it.
         """
 
         protocol = self.Protocol(self.expiry, self.group_expiry,
-                                 self.get_capacity, self.crypter, future)
+                                 self.get_capacity, self.crypter)
         amqp_channel = self.connection.channel(
-            partial(protocol.register_channel, method),
+            partial(protocol.register_channel, method)
         )
         # Handle AMQP channel level errors with protocol.
         amqp_channel.on_callback_error_callback = protocol.protocol_error
@@ -778,7 +798,7 @@ class RabbitmqConnection(object):
         # connection event loop.
         future = Future()
         with self.lock:
-            self.process(get_ident(), (f, args, kwargs), future)
+            self.process(get_ident(), (f, args, kwargs, future))
         return future
 
     @property
@@ -799,7 +819,7 @@ class RabbitmqConnection(object):
         self.wait_open()
         future = Future()
         with self.lock:
-            self.open_amqp_channel((f, args, kwargs), future)
+            self.open_amqp_channel((f, args, kwargs, future))
         return future
 
 

@@ -753,7 +753,7 @@ class RabbitmqConnection(object):
         # Remember protocol for future use.
         self.protocols[ident] = protocol
 
-    def open_amqp_channel(self, method):
+    def open_amqp_channel(self, method, single_use=False):
         """
         Open new AMQP Channel and associate new `Protocol` instance with
         it.
@@ -766,6 +766,9 @@ class RabbitmqConnection(object):
         )
         # Handle AMQP channel level errors with protocol.
         amqp_channel.on_callback_error_callback = protocol.protocol_error
+        if single_use:
+            future = method[-1]
+            future.add_done_callback(lambda method_frame: amqp_channel.close())
         return protocol
 
     def wait_open(self):
@@ -819,7 +822,7 @@ class RabbitmqConnection(object):
         self.wait_open()
         future = Future()
         with self.lock:
-            self.open_amqp_channel((f, args, kwargs, future))
+            self.open_amqp_channel((f, args, kwargs, future), single_use=True)
         return future
 
 
@@ -859,7 +862,6 @@ class ConnectionThread(Thread):
         in the end.
         """
 
-        # FIXME: Close AMQP channels opened by twisted.
         return self.connection.twisted_schedule(f, *args, **kwargs)
 
 

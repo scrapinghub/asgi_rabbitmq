@@ -12,7 +12,7 @@ from cached_property import threaded_cached_property
 from pika import SelectConnection, URLParameters
 from pika.channel import Channel
 from pika.exceptions import ChannelClosed, ConnectionClosed
-from pika.spec import Basic, BasicProperties
+from pika.spec import Basic, BasicProperties, Confirm
 
 try:
     from concurrent.futures import Future
@@ -140,10 +140,18 @@ class Protocol(object):
         if future is not None:
             self.messages[self.message_number] = future
         # enable delivery confirmations once on first message
-        if not self.are_confirmations_enabled:
+        if self.are_confirmations_enabled:
+            self.amqp_channel.basic_publish(mandatory=True, **kwargs)
+        else:
+            self.amqp_channel.add_callback(
+                lambda unused_frame: self.amqp_channel.basic_publish(
+                    mandatory=True,
+                    **kwargs,
+                ),
+                [Confirm.SelectOk],
+            )
             self.amqp_channel.confirm_delivery(self.on_delivery_confirmation)
             self.are_confirmations_enabled = True
-        self.amqp_channel.basic_publish(mandatory=True, **kwargs)
 
     def on_delivery_confirmation(self, frame):
         for message_number in range(

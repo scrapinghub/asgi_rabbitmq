@@ -90,11 +90,19 @@ class Protocol(object):
         self.confirmed_message_number = -1
         self.are_confirmations_enabled = False
 
-        self.amqp_channel = channel_factory(self.apply_waiting)
+        self.amqp_channel = channel_factory(self.on_connect)
         # Handle AMQP channel level errors with protocol.
         self.amqp_channel.on_callback_error_callback = self.protocol_error
 
     # Utilities.
+
+    def on_connect(self, unused_channel):
+        # set prefetch count for the channel to prevent redelivery
+        # amplification when the consumer stops consuming after each message
+        self.amqp_channel.basic_qos(
+            self.apply_waiting,
+            prefetch_count=1,
+        )
 
     def apply(self, method_id, args, kwargs, future):
         """Take method from the mapping and call it."""
@@ -104,7 +112,7 @@ class Protocol(object):
         else:
             self.waiting_calls.append((method_id, args, kwargs, future))
 
-    def apply_waiting(self, unused_channel):
+    def apply_waiting(self, unused_frame):
         if self.is_open:
             for call in self.waiting_calls:
                 self.apply(*call)
@@ -263,10 +271,10 @@ class Protocol(object):
     def consume_message(self, future, consumer_tags, amqp_channel,
                         method_frame, properties, body):
 
-        amqp_channel.basic_ack(method_frame.delivery_tag)
         # Cancel parallel consumers.
         for tag in consumer_tags:
             amqp_channel.basic_cancel(consumer_tag=tag)
+        amqp_channel.basic_ack(method_frame.delivery_tag)
         # Send the message to the waiting thread.
         channel = consumer_tags[method_frame.consumer_tag]
         if properties.headers and 'asgi_channel' in properties.headers:

@@ -199,7 +199,7 @@ class Protocol(object):
         amqp_channel.basic_ack(method_frame.delivery_tag)
         # Cancel parallel consumers.
         for tag in consumer_tags:
-            amqp_channel.basic_cancel(consumer_tag=tag, nowait=True)
+            amqp_channel.basic_cancel(consumer_tag=tag)
         # Send the message to the waiting thread.
         channel = consumer_tags[method_frame.consumer_tag]
         if properties.headers and 'asgi_channel' in properties.headers:

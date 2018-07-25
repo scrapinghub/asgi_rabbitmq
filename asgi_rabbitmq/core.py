@@ -1,6 +1,8 @@
 import base64
 import hashlib
+import logging
 import random
+import time
 from functools import partial
 from string import ascii_letters as ASCII
 
@@ -27,6 +29,8 @@ try:
     TWISTED_AVAILABLE = True
 except ImportError:
     TWISTED_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 SEND = 0
 RECEIVE = 1
@@ -64,6 +68,7 @@ class Protocol(object):
             EXPIRE_GROUP_MEMBER: self.expire_group_member,
             RECEIVE_TWISTED: self.receive_twisted,
         }
+        self.are_confirmations_enabled = False
 
     # Utilities.
 
@@ -120,7 +125,10 @@ class Protocol(object):
 
     def publish_message(self, channel, body):
         """Channel capacity check is done.  Publish message."""
-
+        # enable delivery confirmations once on first message
+        if not self.are_confirmations_enabled:
+            self.amqp_channel.confirm_delivery(self.on_delivery_confirmation)
+            self.are_confirmations_enabled = True
         queue = self.get_queue_name(channel)
         self.amqp_channel.basic_publish(
             exchange='',
@@ -128,6 +136,8 @@ class Protocol(object):
             body=body,
             properties=self.publish_properties(channel),
         )
+
+    def on_delivery_confirmation(self, frame):
         self.resolve.set_result(None)
 
     def publish_properties(self, channel=None):
@@ -199,7 +209,7 @@ class Protocol(object):
         amqp_channel.basic_ack(method_frame.delivery_tag)
         # Cancel parallel consumers.
         for tag in consumer_tags:
-            amqp_channel.basic_cancel(consumer_tag=tag, nowait=True)
+            amqp_channel.basic_cancel(consumer_tag=tag)
         # Send the message to the waiting thread.
         channel = consumer_tags[method_frame.consumer_tag]
         if properties.headers and 'asgi_channel' in properties.headers:
@@ -631,43 +641,67 @@ class RabbitmqConnection(object):
         self.get_capacity = get_capacity
         self.crypter = crypter
 
-        # Thread to protocol instance mapping.
-        self.protocols = {}
         # Connection access lock.
         self.lock = Lock()
         # Connection startup event.
         self.is_open = Event()
         self.parameters = self.Parameters(self.url)
-        self.connection = self.Connection(
-            parameters=self.parameters,
-            on_open_callback=self.start_loop,
-            on_close_callback=self.teardown_loop,
-            on_callback_error_callback=self.protocol_error,
-            stop_ioloop_on_close=False,
-            lock=self.lock,
-        )
+        self.connection = self.connect()
 
     def run(self):
         """Start connection event loop."""
 
         self.connection.ioloop.start()
 
-    def start_loop(self, connection):
+    def connect(self):
+        """Prepare connection state."""
+
+        # Connection startup event.
+        self.is_open.clear()
+        # Thread to protocol instance mapping.
+        self.protocols = {}
+        # Connection object.
+        return self.Connection(
+            parameters=self.parameters,
+            on_open_callback=self.on_connection_open,
+            on_close_callback=self.on_connection_closed,
+            on_callback_error_callback=self.protocol_error,
+            stop_ioloop_on_close=False,
+            lock=self.lock,
+        )
+
+    def on_connection_open(self, connection):
         """Connection open callback."""
 
         self.is_open.set()
         self.process(None, (DECLARE_DEAD_LETTERS, (), {}), Future())
 
-    def teardown_loop(self, connection, code, msg):
+    def on_connection_closed(self, connection, code, msg):
         """
         Connection close callback.  By default notify all waiting threads
-        about connection state, then teardown event loop.
+        about connection state, then teardown event loop or try to reconnect.
         """
 
         try:
             self.protocol_error(ConnectionClosed())
-        finally:
+        except:
+            logger.warning('Exception when notifying threads about closed '
+                           'connection', exc_info=True)
+        if self.connection.is_closing:
             self.connection.ioloop.stop()
+        else:
+            logger.info('Connection closed, reopening in 5 seconds')
+            self.connection.add_timeout(5, self.reconnect)
+
+    def reconnect(self):
+        """Create new connection and restart IO loop."""
+
+        self.connection.ioloop.stop()
+        if not self.connection.is_closing:
+            # Create a new connection
+            self.connection = self.connect()
+            # There is now a new connection, needs a new ioloop to run
+            self.connection.ioloop.start()
 
     def protocol_error(self, error):
         """
@@ -730,7 +764,13 @@ class RabbitmqConnection(object):
         thread.
         """
 
+        # This method is accessed from other thread.  We must ensure
+        # that connection event loop is ready.
         self.wait_open()
+        # Connection maybe unset, so it must be checked only after
+        # connection bootstrap process finish.
+        if self.connection.is_closing or self.connection.is_closed:
+            raise ConnectionClosed
         # RabbitMQ operations are multiplexed between different AMQP
         # method callbacks.  Final result of the protocol method call
         # will be set inside one of this callbacks.  So other thread
@@ -869,8 +909,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Send the message to the channel."""
 
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.schedule(SEND, channel, message)
-        return future.result()
+        return self._schedule(SEND, channel, message)
 
     def receive(self, channels, block=False):
         """Receive one message from one of the channels."""
@@ -878,8 +917,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         for channel in channels:
             fail_msg = 'Channel name %s is not valid' % channel
             assert self.valid_channel_name(channel, receive=True), fail_msg
-        future = self.thread.schedule(RECEIVE, channels, block)
-        return future.result()
+        return self._schedule(RECEIVE, channels, block)
 
     def new_channel(self, pattern):
         """Create new single reader channel."""
@@ -887,8 +925,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert pattern.endswith('?')
         random_string = "".join(random.choice(ASCII) for i in range(20))
         new_name = pattern + random_string
-        future = self.thread.schedule(NEW_CHANNEL, new_name)
-        future.result()
+        self._schedule(NEW_CHANNEL, new_name)
         return new_name
 
     def group_add(self, group, channel):
@@ -896,29 +933,39 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.schedule(GROUP_ADD, group, channel)
-        return future.result()
+        return self._schedule(GROUP_ADD, group, channel)
 
     def group_discard(self, group, channel):
         """Remove the channel from the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.schedule(GROUP_DISCARD, group, channel)
-        return future.result()
+        return self._schedule(GROUP_DISCARD, group, channel)
 
     def send_group(self, group, message):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
-        future = self.thread.schedule(SEND_GROUP, group, message)
         try:
-            return future.result()
+            return self._schedule(SEND_GROUP, group, message)
         except ChannelClosed:
             # Channel was closed because corresponding group exchange
             # does not exist yet.  This mean no one call `group_add`
             # yet, so group is empty and we should not worry about.
             pass
+
+    def _schedule(self, f, *args, **kwargs):
+        """Schedule action and wait for result with retrying logic."""
+
+        while True:
+            try:
+                future = self.thread.schedule(f, *args, *kwargs)
+                return future.result()
+            except ConnectionClosed:
+                delay = self.thread.connection.parameters.retry_delay
+                logger.warning(
+                    'Disconnected, retrying after %s seconds', delay)
+                time.sleep(delay)
 
     if TWISTED_AVAILABLE:
 

@@ -861,7 +861,14 @@ class ConnectionThread(Thread):
         connection thread.
         """
 
-        return self.connection.schedule(f, *args, **kwargs)
+        while True:
+            try:
+                return self.connection.schedule(f, *args, **kwargs)
+            except ConnectionClosed:
+                delay = self.connection.parameters.retry_delay
+                logger.warning(
+                    'Disconnected, retrying after %s seconds', delay)
+                time.sleep(delay)
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):
@@ -930,7 +937,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Send the message to the channel."""
 
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        return self._schedule(SEND, channel, message)
+        future = self.thread.schedule(SEND, channel, message)
+        return future.result()
 
     def receive(self, channels, block=False):
         """Receive one message from one of the channels."""
@@ -938,7 +946,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         for channel in channels:
             fail_msg = 'Channel name %s is not valid' % channel
             assert self.valid_channel_name(channel, receive=True), fail_msg
-        return self._schedule(RECEIVE, channels, block)
+        future = self.thread.schedule(RECEIVE, channels, block)
+        return future.result()
 
     def new_channel(self, pattern):
         """Create new single reader channel."""
@@ -946,7 +955,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert pattern.endswith('?')
         random_string = "".join(random.choice(ASCII) for i in range(20))
         new_name = pattern + random_string
-        self._schedule(NEW_CHANNEL, new_name)
+        future = self.thread.schedule(NEW_CHANNEL, new_name)
+        future.result()
         return new_name
 
     def group_add(self, group, channel):
@@ -954,39 +964,29 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        return self._schedule(GROUP_ADD, group, channel)
+        future = self.thread.schedule(GROUP_ADD, group, channel)
+        return future.result()
 
     def group_discard(self, group, channel):
         """Remove the channel from the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        return self._schedule(GROUP_DISCARD, group, channel)
+        future = self.thread.schedule(GROUP_DISCARD, group, channel)
+        return future.result()
 
     def send_group(self, group, message):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
         try:
-            return self._schedule(SEND_GROUP, group, message)
+            future = self.thread.schedule(SEND_GROUP, group, message)
+            return future.result()
         except ChannelClosed:
             # Channel was closed because corresponding group exchange
             # does not exist yet.  This mean no one call `group_add`
             # yet, so group is empty and we should not worry about.
             pass
-
-    def _schedule(self, f, *args, **kwargs):
-        """Schedule action and wait for result with retrying logic."""
-
-        while True:
-            try:
-                future = self.thread.schedule(f, *args, *kwargs)
-                return future.result()
-            except ConnectionClosed:
-                delay = self.thread.connection.parameters.retry_delay
-                logger.warning(
-                    'Disconnected, retrying after %s seconds', delay)
-                time.sleep(delay)
 
     if TWISTED_AVAILABLE:
 

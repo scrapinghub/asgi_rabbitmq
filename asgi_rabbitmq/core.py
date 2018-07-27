@@ -583,12 +583,19 @@ class Protocol(object):
             self.amqp_channel.queue_declare(
                 do_bind,
                 queue=self.dead_letters,
+                arguments={
+                    'x-expires': max(
+                        self.expiry * 2000,
+                        self.group_expiry * 1000,
+                    ) * 2,
+                },
             )
 
         self.amqp_channel.exchange_declare(
             declare_queue,
             exchange=self.dead_letters,
             exchange_type='fanout',
+            auto_delete=True,
         )
 
     def on_dead_letter(self, amqp_channel, method_frame, properties, body):

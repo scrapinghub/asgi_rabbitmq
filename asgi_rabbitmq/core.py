@@ -104,6 +104,9 @@ class Protocol(object):
         self.amqp_channel.basic_qos(
             self.apply_waiting,
             prefetch_count=1,
+            # in RabbitMQ this is actually all consumers on the channel
+            # https://www.rabbitmq.com/consumer-prefetch.html
+            all_channels=True,
         )
 
     def apply(self, method_id, args, kwargs, future):
@@ -273,12 +276,15 @@ class Protocol(object):
     def consume_message(self, future, consumer_tags, amqp_channel,
                         method_frame, properties, body):
 
+        consumer_tag = method_frame.consumer_tag
         # Cancel parallel consumers.
         for tag in consumer_tags:
-            amqp_channel.basic_cancel(consumer_tag=tag)
+            if tag != consumer_tag:
+                amqp_channel.basic_cancel(consumer_tag=tag)
+        amqp_channel.basic_cancel(consumer_tag=consumer_tag)
         amqp_channel.basic_ack(method_frame.delivery_tag)
         # Send the message to the waiting thread.
-        channel = consumer_tags[method_frame.consumer_tag]
+        channel = consumer_tags[consumer_tag]
         if properties.headers and 'asgi_channel' in properties.headers:
             channel = channel + properties.headers['asgi_channel']
         message = self.deserialize(body)
@@ -1038,6 +1044,11 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
             while True:
                 try:
+                    channel, message = yield deferred_from_future(
+                        self.thread.schedule(RECEIVE, channels, block=False)
+                    )
+                    if channel is not None:
+                        defer.returnValue((channel, message))
                     result = yield deferred_from_future(
                         self.thread.schedule(RECEIVE, channels, block=True)
                     )

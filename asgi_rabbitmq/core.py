@@ -67,6 +67,8 @@ class Protocol(object):
 
     dead_letters = 'dead-letters'
     """Name of the protocol dead letters exchange and queue."""
+    group_auto_expire = 'group-auto-expire'
+    """Name of the protocol empty group expiry queue."""
 
     def __init__(self, channel_factory, expiry, group_expiry, get_capacity,
                  crypter):
@@ -432,6 +434,7 @@ class Protocol(object):
             declare_member,
             exchange=group,
             exchange_type='fanout',
+            auto_delete=True,
         )
 
     def group_discard(self, future, group, channel):
@@ -460,10 +463,46 @@ class Protocol(object):
         callback.
         """
 
+        def bind_auto_expire_channel(method_frame):
+            self.amqp_channel.queue_bind(
+                partial(self.group_declared, future, group, message),
+                queue=self.group_auto_expire,
+                exchange=self.group_auto_expire,
+            )
+
+        def bind_auto_expire_exchange(method_frame):
+            self.amqp_channel.exchange_bind(
+                bind_auto_expire_channel,
+                destination=self.group_auto_expire,
+                source=group,
+            )
+
+        def declare_auto_expire_group(method_frame):
+            self.amqp_channel.queue_declare(
+                bind_auto_expire_exchange,
+                queue=self.group_auto_expire,
+                arguments={
+                    'x-dead-letter-exchange': self.dead_letters,
+                    'x-expires': 25,
+                    'x-max-length': 0,
+                },
+            )
+
+        def declare_auto_expire_exchange(method_frame):
+            self.amqp_channel.exchange_declare(
+                declare_auto_expire_group,
+                exchange=self.group_auto_expire,
+                exchange_type='fanout',
+                auto_delete=True,
+            )
+
+        # Declare group exchange and start one of the callback chains
+        # described above.
         self.amqp_channel.exchange_declare(
-            partial(self.group_declared, future, group, message),
+            declare_auto_expire_exchange,
             exchange=group,
             exchange_type='fanout',
+            auto_delete=True,
         )
 
     def group_declared(self, future, group, message, method_frame):
@@ -979,14 +1018,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
-        try:
-            future = self.thread.schedule(SEND_GROUP, group, message)
-            return future.result()
-        except ChannelClosed:
-            # Channel was closed because corresponding group exchange
-            # does not exist yet.  This mean no one call `group_add`
-            # yet, so group is empty and we should not worry about.
-            pass
+        future = self.thread.schedule(SEND_GROUP, group, message)
+        return future.result()
 
     if TWISTED_AVAILABLE:
 

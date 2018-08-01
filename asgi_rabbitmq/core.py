@@ -15,9 +15,9 @@ from pika.exceptions import ChannelClosed, ConnectionClosed
 from pika.spec import Basic, BasicProperties, Confirm
 
 try:
-    from concurrent.futures import Future
+    from concurrent.futures import Future, CancelledError, TimeoutError
 except ImportError:
-    from futures import Future
+    from futures import Future, CancelledError, TimeoutError
 
 try:
     from threading import Thread, Lock, Event, get_ident
@@ -272,23 +272,34 @@ class Protocol(object):
                 queue=self.get_queue_name(channel),
             )
             consumer_tags[tag] = channel
+        future.add_done_callback(
+            partial(self.cancel_consuming, consumer_tags=consumer_tags)
+        )
 
     def consume_message(self, future, consumer_tags, amqp_channel,
                         method_frame, properties, body):
 
-        consumer_tag = method_frame.consumer_tag
-        # Cancel parallel consumers.
+        # Don't allow cancel after we got a message
+        if future.set_running_or_notify_cancel():
+            consumer_tag = method_frame.consumer_tag
+            # Cancel parallel consumers.
+            for tag in consumer_tags:
+                if tag != consumer_tag:
+                    amqp_channel.basic_cancel(consumer_tag=tag)
+            amqp_channel.basic_cancel(consumer_tag=consumer_tag)
+            amqp_channel.basic_ack(method_frame.delivery_tag)
+            # Send the message to the waiting thread.
+            channel = consumer_tags[consumer_tag]
+            consumer_tags.clear()
+            if properties.headers and 'asgi_channel' in properties.headers:
+                channel = channel + properties.headers['asgi_channel']
+            message = self.deserialize(body)
+            future.set_result((channel, message))
+
+    def cancel_consuming(self, future, consumer_tags):
         for tag in consumer_tags:
-            if tag != consumer_tag:
-                amqp_channel.basic_cancel(consumer_tag=tag)
-        amqp_channel.basic_cancel(consumer_tag=consumer_tag)
-        amqp_channel.basic_ack(method_frame.delivery_tag)
-        # Send the message to the waiting thread.
-        channel = consumer_tags[consumer_tag]
-        if properties.headers and 'asgi_channel' in properties.headers:
-            channel = channel + properties.headers['asgi_channel']
-        message = self.deserialize(body)
-        future.set_result((channel, message))
+            self.amqp_channel.basic_cancel(consumer_tag=tag)
+        consumer_tags.clear()
 
     # Non blocking receive.
 
@@ -942,6 +953,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
                  group_expiry=86400,
                  capacity=100,
                  channel_capacity=None,
+                 receive_timeout=10,
                  symmetric_encryption_keys=None):
 
         super(RabbitmqChannelLayer, self).__init__(
@@ -950,6 +962,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             capacity=capacity,
             channel_capacity=channel_capacity,
         )
+        self.receive_timeout = receive_timeout
         if symmetric_encryption_keys:
             try:
                 from cryptography.fernet import MultiFernet
@@ -999,7 +1012,12 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             fail_msg = 'Channel name %s is not valid' % channel
             assert self.valid_channel_name(channel, receive=True), fail_msg
         future = self.thread.schedule(RECEIVE, channels, block)
-        return future.result()
+        try:
+            return future.result(timeout=self.receive_timeout)
+        except TimeoutError:
+            if not future.cancel():
+                return future.result()
+            return None, None
 
     def new_channel(self, pattern):
         """Create new single reader channel."""
@@ -1049,10 +1067,17 @@ class RabbitmqChannelLayer(BaseChannelLayer):
                     )
                     if channel is not None:
                         defer.returnValue((channel, message))
-                    result = yield deferred_from_future(
-                        self.thread.schedule(RECEIVE, channels, block=True)
+                    future = self.thread.schedule(
+                        RECEIVE, channels, block=True,
                     )
+                    timeout = reactor.callLater(
+                        self.receive_timeout, future.cancel,
+                    )
+                    result = yield deferred_from_future(future)
+                    timeout.cancel()
                     defer.returnValue(result)
+                except CancelledError:
+                    defer.returnValue((None, None))
                 except ConnectionClosed:
                     delay = self.thread.connection.parameters.retry_delay
                     logger.warning(

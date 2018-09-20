@@ -89,6 +89,7 @@ class Protocol(object):
         self.waiting_calls = []
         self.messages = {}
         self.message_number = 0
+        self.unresolved_futures = set()
         self.confirmed_message_number = -1
         self.are_confirmations_enabled = False
 
@@ -113,6 +114,7 @@ class Protocol(object):
         """Take method from the mapping and call it."""
 
         if self.is_open:
+            self.register_future(future)
             self.methods[method_id](future, *args, **kwargs)
         else:
             self.waiting_calls.append((method_id, args, kwargs, future))
@@ -123,13 +125,21 @@ class Protocol(object):
                 self.apply(*call)
             self.waiting_calls.clear()
 
+    def register_future(self, future):
+        if isinstance(future, Future):
+            future.add_done_callback(self.unregister_future)
+            self.unresolved_futures.add(future)
+
+    def unregister_future(self, future):
+        self.unresolved_futures.discard(future)
+
     def protocol_error(self, error):
         """
         AMQP channel level error callback.  Pass error to the waiting
         thread.
         """
 
-        for future in self.messages.values():
+        for future in list(self.unresolved_futures):
             future.set_exception(error)
 
     def get_queue_name(self, channel):
@@ -986,8 +996,12 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.schedule(GROUP_ADD, group, channel)
-        return future.result()
+        while True:
+            future = self.thread.schedule(GROUP_ADD, group, channel)
+            try:
+                return future.result()
+            except ChannelClosed:
+                pass
 
     def group_discard(self, group, channel):
         """Remove the channel from the group."""

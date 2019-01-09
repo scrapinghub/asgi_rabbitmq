@@ -89,14 +89,12 @@ class RabbitmqChannelLayer(BaseChannelLayer):
                 queue = await channel_obj.declare_queue(
                     queue_name, arguments=self.queue_arguments
                 )
-                # FIXME not 100% sure about parameters here
                 await queue.unbind(exchange=group)
             else:
                 exchange = await channel_obj.declare_exchange(
                     name=channel, type=ExchangeType.FANOUT,
                     auto_delete=True,
                 )
-                # FIXME not 100% sure about parameters here
                 await exchange.unbind(exchange=group)
 
     #  Auxiliary utilities

@@ -897,15 +897,6 @@ class ConnectionThread(Thread):
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):
-    """
-    RabbitMQ channel layer.
-
-    It routes all messages into remote RabbitMQ server.  Support for
-    RabbitMQ cluster and message encryption are provided.  Only
-    synchronous approach is implemented.
-    """
-
-    extensions = ['groups']
 
     Thread = ConnectionThread
 
@@ -920,7 +911,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         super(RabbitmqChannelLayer, self).__init__(
             expiry=expiry,
-            group_expiry=group_expiry,
+            # FIXME no such parameter
+            # group_expiry=group_expiry,
             capacity=capacity,
             channel_capacity=channel_capacity,
         )
@@ -960,14 +952,14 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         formatted_key = base64.urlsafe_b64encode(hashlib.sha256(key).digest())
         return Fernet(formatted_key)
 
-    def send(self, channel, message):
+    # API
+
+    async def send(self, channel, message):
         """Send the message to the channel."""
-
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        future = self.thread.schedule(SEND, channel, message)
-        return future.result()
+        return await self.thread.schedule(SEND, channel, message)
 
-    def receive(self, channels, block=False):
+    async def receive(self, channel):
         """Receive one message from one of the channels."""
 
         for channel in channels:
@@ -981,81 +973,42 @@ class RabbitmqChannelLayer(BaseChannelLayer):
                 return future.result()
             return None, None
 
-    def new_channel(self, pattern):
+    async def new_channel(self, prefix="specific"):
         """Create new single reader channel."""
 
         assert pattern.endswith('?')
         random_string = "".join(random.choice(ASCII) for i in range(20))
         new_name = pattern + random_string
-        future = self.thread.schedule(NEW_CHANNEL, new_name)
-        future.result()
+        await self.thread.schedule(NEW_CHANNEL, new_name)
         return new_name
 
-    def group_add(self, group, channel):
+    async def group_add(self, group, channel):
         """Add channel to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
         while True:
-            future = self.thread.schedule(GROUP_ADD, group, channel)
             try:
-                return future.result()
+                return await self.thread.schedule(GROUP_ADD, group, channel)
             except ChannelClosed:
                 pass
 
-    def group_discard(self, group, channel):
+    async def group_discard(self, group, channel):
         """Remove the channel from the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
         future = self.thread.schedule(GROUP_DISCARD, group, channel)
-        return future.result()
+        return await future future.result()
 
-    def send_group(self, group, message):
+        def send_group(self, group, message):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
-        future = self.thread.schedule(SEND_GROUP, group, message)
         try:
-            return future.result()
+            return await self.thread.schedule(SEND_GROUP, group, message)
         except ChannelClosed:
             # Channel was closed because corresponding group exchange
             # does not exist yet.  This mean no one call `group_add`
             # yet, so group is empty and we should not worry about.
             pass
-
-    if TWISTED_AVAILABLE:
-
-        extensions.append('twisted')
-
-        @defer.inlineCallbacks
-        def receive_twisted(self, channels):
-            """Twisted-native implementation of receive."""
-
-            while True:
-                try:
-                    channel, message = yield deferred_from_future(
-                        self.thread.schedule(RECEIVE, channels, block=False)
-                    )
-                    if channel is not None:
-                        defer.returnValue((channel, message))
-                    future = self.thread.schedule(
-                        RECEIVE, channels, block=True,
-                    )
-                    timeout = reactor.callLater(
-                        self.receive_timeout, future.cancel,
-                    )
-                    result = yield deferred_from_future(future)
-                    timeout.cancel()
-                    defer.returnValue(result)
-                except CancelledError:
-                    defer.returnValue((None, None))
-                except ConnectionClosed:
-                    delay = self.thread.connection.parameters.retry_delay
-                    logger.warning(
-                        'Disconnected, retrying after %s seconds', delay)
-                    yield deferred_sleep(delay)
-
-# TODO: Is it optimal to read bytes from content frame, call python
-# decode method to convert it to string and than parse it with
-# msgpack?  We should minimize useless work on message receive.

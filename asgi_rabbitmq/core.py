@@ -899,6 +899,8 @@ class ConnectionThread(Thread):
 
 class RabbitmqChannelLayer(BaseChannelLayer):
 
+    extensions = ['groups']
+
     Thread = ConnectionThread
 
     def __init__(self,

@@ -16,7 +16,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'pika~=0.10.0',
-        'asgiref~=1.0.0',
+        'asgiref~=2.3.0',
         'msgpack-python',
         'cached-property',
         'futures ; python_version < "3.0"',

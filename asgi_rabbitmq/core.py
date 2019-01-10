@@ -7,7 +7,8 @@ from functools import partial
 from string import ascii_letters as ASCII
 
 import msgpack
-from asgiref.base_layer import BaseChannelLayer
+from asyncio import wrap_future, wait_for, TimeoutError
+from channels.layers import BaseChannelLayer
 from cached_property import threaded_cached_property
 from pika import SelectConnection, URLParameters
 from pika.channel import Channel
@@ -15,9 +16,9 @@ from pika.exceptions import ChannelClosed, ConnectionClosed
 from pika.spec import Basic, BasicProperties, Confirm
 
 try:
-    from concurrent.futures import Future, CancelledError, TimeoutError
+    from concurrent.futures import Future
 except ImportError:
-    from futures import Future, CancelledError, TimeoutError
+    from futures import Future
 
 try:
     from threading import Thread, Lock, Event, get_ident
@@ -957,29 +958,30 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     async def send(self, channel, message):
         """Send the message to the channel."""
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        return await self.thread.schedule(SEND, channel, message)
+        return await wrap_future(self.thread.schedule(SEND, channel, message))
 
     async def receive(self, channel):
         """Receive one message from one of the channels."""
 
-        for channel in channels:
-            fail_msg = 'Channel name %s is not valid' % channel
-            assert self.valid_channel_name(channel, receive=True), fail_msg
-        future = self.thread.schedule(RECEIVE, channels, block)
+        fail_msg = 'Channel name %s is not valid' % channel
+        assert self.valid_channel_name(channel, receive=True), fail_msg
+        future = self.thread.schedule(RECEIVE, [channel], True)
+        return await wrap_future(future)
+        # FIXME
         try:
-            return future.result(timeout=self.receive_timeout)
+            wait_for(wrap_future(future), self.receive_timeout)
+            return future.result()
         except TimeoutError:
             if not future.cancel():
                 return future.result()
             return None, None
 
-    async def new_channel(self, prefix="specific"):
+    async def new_channel(self, prefix="specific."):
         """Create new single reader channel."""
-
-        assert pattern.endswith('?')
+        # assert prefix.endswith('?')
         random_string = "".join(random.choice(ASCII) for i in range(20))
-        new_name = pattern + random_string
-        await self.thread.schedule(NEW_CHANNEL, new_name)
+        new_name = prefix + random_string
+        await wrap_future(self.thread.schedule(NEW_CHANNEL, new_name))
         return new_name
 
     async def group_add(self, group, channel):
@@ -988,8 +990,9 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
         while True:
+            future = self.thread.schedule(GROUP_ADD, group, channel)
             try:
-                return await self.thread.schedule(GROUP_ADD, group, channel)
+                return await wrap_future(future)
             except ChannelClosed:
                 pass
 
@@ -999,14 +1002,15 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
         future = self.thread.schedule(GROUP_DISCARD, group, channel)
-        return await future future.result()
+        return await wrap_future(future)
 
-        def send_group(self, group, message):
+    async def group_send(self, group, message):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
+        future = self.thread.schedule(SEND_GROUP, group, message)
         try:
-            return await self.thread.schedule(SEND_GROUP, group, message)
+            return await wrap_future(future)
         except ChannelClosed:
             # Channel was closed because corresponding group exchange
             # does not exist yet.  This mean no one call `group_add`

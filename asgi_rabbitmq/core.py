@@ -920,11 +920,10 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         super(RabbitmqChannelLayer, self).__init__(
             expiry=expiry,
-            # FIXME no such parameter
-            # group_expiry=group_expiry,
             capacity=capacity,
             channel_capacity=channel_capacity,
         )
+        self.group_expiry = group_expiry
         self.receive_timeout = receive_timeout
         if symmetric_encryption_keys:
             try:

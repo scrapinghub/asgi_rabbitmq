@@ -898,6 +898,12 @@ class ConnectionThread(Thread):
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):
+    """
+    RabbitMQ channel layer.
+
+    It routes all messages into remote RabbitMQ server. Support for
+    RabbitMQ cluster and message encryption are provided.
+    """
 
     extensions = ['groups']
 
@@ -968,11 +974,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel, receive=True), fail_msg
         future = self.thread.schedule(RECEIVE, [channel], True)
-        return await wrap_future(future)
-        # FIXME
         try:
-            wait_for(wrap_future(future), self.receive_timeout)
-            return future.result()
+            return await wait_for(wrap_future(future), self.receive_timeout)
         except TimeoutError:
             if not future.cancel():
                 return future.result()

@@ -915,7 +915,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
                  group_expiry=86400,
                  capacity=100,
                  channel_capacity=None,
-                 receive_timeout=10,
                  symmetric_encryption_keys=None):
 
         super(RabbitmqChannelLayer, self).__init__(
@@ -924,7 +923,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             channel_capacity=channel_capacity,
         )
         self.group_expiry = group_expiry
-        self.receive_timeout = receive_timeout
         if symmetric_encryption_keys:
             try:
                 from cryptography.fernet import MultiFernet
@@ -972,13 +970,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel, receive=True), fail_msg
-        future = self.thread.schedule(RECEIVE, [channel], True)
-        try:
-            return await wait_for(wrap_future(future), self.receive_timeout)
-        except TimeoutError:
-            if not future.cancel():
-                return future.result()
-            return None, None
+        return await wrap_future(self.thread.schedule(RECEIVE, [channel], True))
 
     async def new_channel(self, prefix="specific."):
         """Create new single reader channel."""

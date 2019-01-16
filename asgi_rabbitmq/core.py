@@ -908,6 +908,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
                                    self.get_capacity, crypter)
         self._thread.start()
 
+    @property
     def thread(self):
         """
         Connection thread.  Holds connection heartbeats.  Ensure that

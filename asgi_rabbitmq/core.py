@@ -847,6 +847,7 @@ class ConnectionThread(Thread):
 
     def run(self):
         """Start connection thread."""
+
         self.connection.run()
 
     def schedule(self, f, *args, **kwargs):
@@ -854,6 +855,7 @@ class ConnectionThread(Thread):
         Schedule protocol method execution in the context of the
         connection thread.
         """
+
         while True:
             try:
                 return self.connection.schedule(f, *args, **kwargs)

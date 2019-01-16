@@ -3,53 +3,22 @@ import hashlib
 import logging
 import random
 import time
+from concurrent.futures import Future
 from functools import partial
 from string import ascii_letters as ASCII
 
 import msgpack
-from asyncio import wrap_future, wait_for, TimeoutError
+from asyncio import wrap_future
 from channels.layers import BaseChannelLayer
-from cached_property import threaded_cached_property
 from pika import SelectConnection, URLParameters
 from pika.channel import Channel
 from pika.exceptions import ChannelClosed, ConnectionClosed
 from pika.spec import Basic, BasicProperties, Confirm
 
 try:
-    from concurrent.futures import Future
-except ImportError:
-    from futures import Future
-
-try:
     from threading import Thread, Lock, Event, get_ident
 except ImportError:
     from threading import Thread, Lock, Event, _get_ident as get_ident
-
-try:
-    from twisted.internet import defer, reactor
-    from twisted.python import failure
-    TWISTED_AVAILABLE = True
-
-    def deferred_from_future(future):
-        deferred = defer.Deferred()
-
-        def resolve_deferred(future):
-            try:
-                result = future.result()
-            except:
-                result = failure.Failure()
-            reactor.callFromThread(deferred.callback, result)
-
-        future.add_done_callback(resolve_deferred)
-        return deferred
-
-    def deferred_sleep(delay):
-        deferred = defer.Deferred()
-        reactor.callLater(delay, deferred.callback, None)
-        return deferred
-
-except ImportError:
-    TWISTED_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -878,7 +847,6 @@ class ConnectionThread(Thread):
 
     def run(self):
         """Start connection thread."""
-
         self.connection.run()
 
     def schedule(self, f, *args, **kwargs):
@@ -886,7 +854,6 @@ class ConnectionThread(Thread):
         Schedule protocol method execution in the context of the
         connection thread.
         """
-
         while True:
             try:
                 return self.connection.schedule(f, *args, **kwargs)
@@ -937,15 +904,14 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         # Connection thread will be started on first method access.
         self._thread = self.Thread(url, expiry, group_expiry,
                                    self.get_capacity, crypter)
+        self._thread.start()
 
-    @threaded_cached_property
     def thread(self):
         """
         Connection thread.  Holds connection heartbeats.  Ensure that
         thread is started.
         """
 
-        self._thread.start()
         return self._thread
 
     def make_fernet(self, key):

@@ -903,19 +903,9 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             crypter = MultiFernet(sub_fernets)
         else:
             crypter = None
-        # Connection thread will be started on first method access.
-        self._thread = self.Thread(url, expiry, group_expiry,
-                                   self.get_capacity, crypter)
-        self._thread.start()
-
-    @property
-    def thread(self):
-        """
-        Connection thread.  Holds connection heartbeats.  Ensure that
-        thread is started.
-        """
-
-        return self._thread
+        self.thread = self.Thread(url, expiry, group_expiry,
+                                  self.get_capacity, crypter)
+        self.thread.start()
 
     def make_fernet(self, key):
         """

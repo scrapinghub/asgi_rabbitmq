@@ -836,26 +836,15 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_channel_name(channel), 'Channel name is not valid'
         # Make sure the message does not contain reserved keys
         assert '__asgi_channel__' not in message
-        # If it's a process-local channel, strip off local part and stick full
-        # name in message.
-        channel_non_local_name = channel
-        if '!' in channel:
-            message = dict(message.items())
-            message['__asgi_channel__'] = channel
-            channel_non_local_name = self.non_local_name(channel)
-        channel_key = self._apply_channel_prefix(channel_non_local_name)
+        channel_key = self._apply_channel_prefix(channel)
         return await wrap_future(
             self.thread.schedule(SEND, channel_key, message)
         )
 
     async def receive(self, channel):
         """Receive one message from one of the channels."""
-        if '!' in channel:
-            channel = self.non_local_name(channel)
-            expected_prefix = self.client_prefix + '!'
-            assert channel.endswith(expected_prefix), 'Wrong client prefix'
         fail_msg = 'Channel name %s is not valid' % channel
-        assert self.valid_channel_name(channel, receive=True), fail_msg
+        assert self.valid_channel_name(channel), fail_msg
         _, message = await wrap_future(
             self.thread.schedule(RECEIVE, self._apply_channel_prefix(channel))
         )

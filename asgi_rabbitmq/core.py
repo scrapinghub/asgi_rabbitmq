@@ -212,6 +212,7 @@ class Protocol(object):
             queue,
             arguments=self.queue_arguments,
         )
+        future.add_done_callback(partial(self.cancel_consuming, channel))
 
     def handle_receive(self, future, channel, frame):
         self.amqp_channel.basic_consume(
@@ -222,15 +223,19 @@ class Protocol(object):
     def consume_message(
         self, future, channel, amqp_channel, method_frame, properties, body
     ):
+        # Don't allow cancel after we got a message
+        if future.set_running_or_notify_cancel():
+            consumer_tag = method_frame.consumer_tag
+            amqp_channel.basic_cancel(consumer_tag=consumer_tag)
+            amqp_channel.basic_ack(method_frame.delivery_tag)
+            # Send the message to the waiting thread.
+            if properties.headers and 'asgi_channel' in properties.headers:
+                channel = channel + properties.headers['asgi_channel']
+            message = self.deserialize(body)
+            future.set_result((channel, message))
 
-        consumer_tag = method_frame.consumer_tag
-        amqp_channel.basic_cancel(consumer_tag=consumer_tag)
-        amqp_channel.basic_ack(method_frame.delivery_tag)
-        # Send the message to the waiting thread.
-        if properties.headers and 'asgi_channel' in properties.headers:
-            channel = channel + properties.headers['asgi_channel']
-        message = self.deserialize(body)
-        future.set_result((channel, message))
+    def cancel_consuming(self, future, channel):
+        self.amqp_channel.basic_cancel(consumer_tag=channel)
 
     @property
     def queue_arguments(self):

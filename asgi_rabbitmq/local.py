@@ -15,16 +15,14 @@ class RabbitmqLocalChannelLayer(RabbitmqChannelLayer):
     reply_channel names valid across all workers.
     """
 
-    def __init__(
-        self,
-        url,
-        expiry=60,
-        group_expiry=86400,
-        capacity=100,
-        channel_capacity=None,
-        symmetric_encryption_keys=None,
-        prefix="asgi",
-    ):
+    def __init__(self,
+                 url,
+                 expiry=60,
+                 group_expiry=86400,
+                 capacity=100,
+                 channel_capacity=None,
+                 symmetric_encryption_keys=None,
+                 prefix='asgi'):
 
         # Initialise the base class.
         super(RabbitmqLocalChannelLayer, self).__init__(
@@ -39,7 +37,9 @@ class RabbitmqLocalChannelLayer(RabbitmqChannelLayer):
         try:
             from asgi_ipc import IPCChannelLayer
         except ImportError:
-            raise ValueError("You must install asgi_ipc to use the local variant")
+            raise ValueError(
+                'You must install asgi_ipc to use the local variant',
+            )
         self.local_layer = IPCChannelLayer(
             prefix,
             expiry=expiry,
@@ -54,7 +54,10 @@ class RabbitmqLocalChannelLayer(RabbitmqChannelLayer):
         # If the channel is "normal", use IPC layer, otherwise use
         # RabbitMQ layer.
         if "!" in channel or "?" in channel:
-            return super(RabbitmqLocalChannelLayer, self).send(channel, message)
+            return super(RabbitmqLocalChannelLayer, self).send(
+                channel,
+                message,
+            )
         else:
             return self.local_layer.send(channel, message)
 
@@ -70,12 +73,18 @@ class RabbitmqLocalChannelLayer(RabbitmqChannelLayer):
             result = self.local_layer.receive(channels, block=False)
             if result[0] is not None:
                 return result
-            return super(RabbitmqLocalChannelLayer, self).receive(channels, block)
+            return super(RabbitmqLocalChannelLayer, self).receive(
+                channels,
+                block,
+            )
         # If they just did one type, pass off to that backend.
         elif num_local:
             return self.local_layer.receive(channels, block)
         else:
-            return super(RabbitmqLocalChannelLayer, self).receive(channels, block)
+            return super(RabbitmqLocalChannelLayer, self).receive(
+                channels,
+                block,
+            )
 
     # `new_channel` always goes to RabbitMQ as it's always remote
     # channels.  Group APIs always go to RabbitMQ too.

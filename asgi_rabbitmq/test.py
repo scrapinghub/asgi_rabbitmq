@@ -26,8 +26,7 @@ class RabbitmqLayerTestCaseMixin(object):
         if ChannelTestCaseMixin in self.__class__.__mro__:
             raise ImproperlyConfigured(
                 'ChannelTestCase is not allowed as base class for '
-                'RabbitmqLayerTestCaseMixin'
-            )
+                'RabbitmqLayerTestCaseMixin')
         # Create new virtual host for this test and grant permissions
         # to it.
         hostname = environ.get('RABBITMQ_HOST', 'localhost')
@@ -52,11 +51,14 @@ class RabbitmqLayerTestCaseMixin(object):
                     'BACKEND': layer_class_name,
                     'ROUTING': settings.CHANNEL_LAYERS['default']['ROUTING'],
                     'CONFIG': settings.CHANNEL_LAYERS['default']['CONFIG'],
-                    'TEST_CONFIG': {'url': self.amqp_url},
-                }
-            }
+                    'TEST_CONFIG': {
+                        'url': self.amqp_url,
+                    },
+                },
+            },
         }
-        self._self_overridden_context = override_settings(**self._overridden_settings)
+        self._self_overridden_context = override_settings(
+            **self._overridden_settings)
         self._self_overridden_context.enable()
         super(RabbitmqLayerTestCaseMixin, self)._pre_setup()
 

@@ -36,12 +36,9 @@ class Protocol(object):
 
     dead_letters = 'dead-letters'
     """Name of the protocol dead letters exchange and queue."""
-    group_auto_expire = 'group-auto-expire'
-    """Name of the protocol empty group expiry queue."""
 
-    def __init__(
-        self, channel_factory, prefix, expiry, group_expiry, get_capacity, crypter
-    ):
+    def __init__(self, channel_factory, prefix, expiry, group_expiry,
+                 get_capacity, crypter):
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.get_capacity = get_capacity
@@ -61,10 +58,8 @@ class Protocol(object):
         self.unresolved_futures = set()
         self.confirmed_message_number = -1
         self.are_confirmations_enabled = False
-
-        self.group_auto_expire = f'{prefix}.{self.group_auto_expire}'
-        self.dead_letters = f'{prefix}.{self.dead_letters}'
-
+        if prefix:  # Add prefix to the dead-letter queue/exchange
+            self.dead_letters = f'{prefix}.{self.dead_letters}'
         self.amqp_channel = channel_factory(self.on_connect)
         # Handle AMQP channel level errors with protocol.
         self.amqp_channel.on_callback_error_callback = self.protocol_error
@@ -118,7 +113,7 @@ class Protocol(object):
         """Translate ASGI channel name to the RabbitMQ queue name."""
 
         if '!' in channel:
-            return channel[: channel.rfind('!') + 1]
+            return channel[:channel.rfind('!') + 1]
         else:
             return channel
 
@@ -172,7 +167,8 @@ class Protocol(object):
         else:
             self.amqp_channel.add_callback(
                 lambda unused_frame: self.amqp_channel.basic_publish(
-                    mandatory=True, **kwargs
+                    mandatory=True,
+                    **kwargs,
                 ),
                 [Confirm.SelectOk],
             )
@@ -181,11 +177,9 @@ class Protocol(object):
 
     def on_delivery_confirmation(self, frame):
         for message_number in range(
-            (
-                self.confirmed_message_number + 1
-                if frame.method.multiple
-                else frame.method.delivery_tag
-            ),
+            (self.confirmed_message_number + 1
+             if frame.method.multiple
+             else frame.method.delivery_tag),
             frame.method.delivery_tag + 1,
         ):
             future = self.messages.pop(message_number, None)
@@ -266,7 +260,9 @@ class Protocol(object):
             def bind_channel(method_frame):
 
                 self.amqp_channel.queue_bind(
-                    callback=after_bind, queue=channel, exchange=group
+                    callback=after_bind,
+                    queue=channel,
+                    exchange=group,
                 )
 
             def declare_member(method_frame):
@@ -280,7 +276,6 @@ class Protocol(object):
                         'x-max-length': 0,
                     },
                 )
-
         else:
             # Regular channel and single reader channels needs
             # exchange to exchange binding.  So message will be routed
@@ -289,13 +284,17 @@ class Protocol(object):
             def bind_channel(method_frame):
 
                 self.amqp_channel.queue_bind(
-                    after_bind, queue=channel, exchange=channel
+                    after_bind,
+                    queue=channel,
+                    exchange=channel,
                 )
 
             def bind_group(method_frame):
 
                 self.amqp_channel.exchange_bind(
-                    bind_channel, destination=channel, source=group
+                    bind_channel,
+                    destination=channel,
+                    source=group
                 )
 
             def declare_channel(method_frame):
@@ -321,7 +320,10 @@ class Protocol(object):
         # Declare group exchange and start one of the callback chains
         # described above.
         self.amqp_channel.exchange_declare(
-            declare_member, exchange=group, exchange_type='fanout', auto_delete=True
+            declare_member,
+            exchange=group,
+            exchange_type='fanout',
+            auto_delete=True,
         )
 
     def group_discard(self, future, group, channel):
@@ -332,10 +334,16 @@ class Protocol(object):
                 future.set_result(None)
 
         if '!' in channel:
-            self.amqp_channel.queue_unbind(after_unbind, queue=channel, exchange=group)
+            self.amqp_channel.queue_unbind(
+                after_unbind,
+                queue=channel,
+                exchange=group,
+            )
         else:
             self.amqp_channel.exchange_unbind(
-                after_unbind, destination=channel, source=group
+                after_unbind,
+                destination=channel,
+                source=group,
             )
 
     def send_group(self, future, group, message):
@@ -374,7 +382,10 @@ class Protocol(object):
     def push_marker(self, group, channel, method_frame):
         """The queue was created.  Push the marker."""
 
-        body = self.serialize({'group': group, 'channel': channel})
+        body = self.serialize({
+            'group': group,
+            'channel': channel,
+        })
         self.basic_publish(
             None,
             exchange='',
@@ -396,13 +407,16 @@ class Protocol(object):
         def consume(method_frame):
 
             self.amqp_channel.basic_consume(
-                self.on_dead_letter, queue=self.dead_letters
+                self.on_dead_letter,
+                queue=self.dead_letters,
             )
 
         def do_bind(method_frame):
 
             self.amqp_channel.queue_bind(
-                consume, queue=self.dead_letters, exchange=self.dead_letters
+                consume,
+                queue=self.dead_letters,
+                exchange=self.dead_letters,
             )
 
         def declare_queue(method_frame):
@@ -411,7 +425,10 @@ class Protocol(object):
                 do_bind,
                 queue=self.dead_letters,
                 arguments={
-                    'x-expires': max(self.expiry * 2000, self.group_expiry * 1000) * 2
+                    'x-expires': max(
+                        self.expiry * 2000,
+                        self.group_expiry * 1000
+                    ) * 2,
                 },
             )
 
@@ -490,7 +507,8 @@ class LayerChannel(Channel):
     def _on_deliver(self, method_frame, header_frame, body):
 
         try:
-            super(LayerChannel, self)._on_deliver(method_frame, header_frame, body)
+            super(LayerChannel, self)._on_deliver(method_frame, header_frame,
+                                                  body)
         except Exception as error:
             if self.on_callback_error_callback:
                 self.on_callback_error_callback(error)
@@ -498,7 +516,8 @@ class LayerChannel(Channel):
     def _on_getok(self, method_frame, header_frame, body):
 
         try:
-            super(LayerChannel, self)._on_getok(method_frame, header_frame, body)
+            super(LayerChannel, self)._on_getok(method_frame, header_frame,
+                                                body)
         except Exception as error:
             if self.on_callback_error_callback:
                 self.on_callback_error_callback(error)
@@ -509,7 +528,8 @@ class LayerChannel(Channel):
         if self.on_callback_error_callback:
             self.on_callback_error_callback(
                 ChannelClosed(
-                    method_frame.method.reply_code, method_frame.method.reply_text
+                    method_frame.method.reply_code,
+                    method_frame.method.reply_text,
                 )
             )
 
@@ -524,7 +544,8 @@ class LayerConnection(SelectConnection):
 
     def __init__(self, *args, **kwargs):
 
-        self.on_callback_error_callback = kwargs.pop('on_callback_error_callback')
+        self.on_callback_error_callback = kwargs.pop(
+            'on_callback_error_callback')
         self.lock = kwargs.pop('lock')
         super(LayerConnection, self).__init__(*args, **kwargs)
 
@@ -561,7 +582,8 @@ class RabbitmqConnection(object):
     Connection = LayerConnection
     Protocol = Protocol
 
-    def __init__(self, url, prefix, expiry, group_expiry, get_capacity, crypter):
+    def __init__(self, url, prefix, expiry, group_expiry, get_capacity,
+                 crypter):
 
         self.url = url
         self.prefix = prefix
@@ -615,9 +637,8 @@ class RabbitmqConnection(object):
             self.protocol_error(ConnectionClosed())
         except:
             logger.warning(
-                'Exception when notifying threads about closed connection',
-                exc_info=True,
-            )
+                'Exception when notifying threads about closed '
+                'connection', exc_info=True)
         if self.connection.is_closing:
             self.connection.ioloop.stop()
         else:
@@ -712,7 +733,8 @@ class ConnectionThread(Thread):
 
     Connection = RabbitmqConnection
 
-    def __init__(self, url, prefix, expiry, group_expiry, get_capacity, crypter):
+    def __init__(self, url, prefix, expiry, group_expiry, get_capacity,
+                 crypter):
 
         super(ConnectionThread, self).__init__()
         self.daemon = True
@@ -736,7 +758,8 @@ class ConnectionThread(Thread):
                 return self.connection.schedule(f, *args, **kwargs)
             except ConnectionClosed:
                 delay = self.connection.parameters.retry_delay
-                logger.warning('Disconnected, retrying after %s seconds', delay)
+                logger.warning(
+                    'Disconnected, retrying after %s seconds', delay)
                 time.sleep(delay)
 
 

@@ -294,7 +294,7 @@ class Protocol(object):
                 self.amqp_channel.exchange_bind(
                     bind_channel,
                     destination=channel,
-                    source=group
+                    source=group,
                 )
 
             def declare_channel(method_frame):
@@ -427,7 +427,7 @@ class Protocol(object):
                 arguments={
                     'x-expires': max(
                         self.expiry * 2000,
-                        self.group_expiry * 1000
+                        self.group_expiry * 1000,
                     ) * 2,
                 },
             )
@@ -530,7 +530,7 @@ class LayerChannel(Channel):
                 ChannelClosed(
                     method_frame.method.reply_code,
                     method_frame.method.reply_text,
-                )
+                ),
             )
 
 
@@ -545,7 +545,8 @@ class LayerConnection(SelectConnection):
     def __init__(self, *args, **kwargs):
 
         self.on_callback_error_callback = kwargs.pop(
-            'on_callback_error_callback')
+            'on_callback_error_callback',
+        )
         self.lock = kwargs.pop('lock')
         super(LayerConnection, self).__init__(*args, **kwargs)
 

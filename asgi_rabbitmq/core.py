@@ -208,17 +208,17 @@ class Protocol(object):
 
         queue = self.get_queue_name(channel)
         self.amqp_channel.queue_declare(
-            partial(self.handle_receive, future, channel),
+            partial(self.receive_queue_declared, future, channel),
             queue,
             arguments=self.queue_arguments,
         )
-        future.add_done_callback(partial(self.cancel_consuming, channel))
 
-    def handle_receive(self, future, channel, frame):
-        self.amqp_channel.basic_consume(
+    def receive_queue_declared(self, future, channel, frame):
+        consumer_tag = self.amqp_channel.basic_consume(
             partial(self.consume_message, future, channel),
             queue=self.get_queue_name(channel),
         )
+        future.add_done_callback(partial(self.cancel_consuming, consumer_tag))
 
     def consume_message(
         self, future, channel, amqp_channel, method_frame, properties, body
@@ -232,10 +232,10 @@ class Protocol(object):
             if properties.headers and 'asgi_channel' in properties.headers:
                 channel = channel + properties.headers['asgi_channel']
             message = self.deserialize(body)
-            future.set_result((channel, message))
+            future.set_result(message)
 
-    def cancel_consuming(self, future, channel):
-        self.amqp_channel.basic_cancel(consumer_tag=channel)
+    def cancel_consuming(self, future, consumer_tag):
+        self.amqp_channel.basic_cancel(consumer_tag=consumer_tag)
 
     @property
     def queue_arguments(self):
@@ -845,7 +845,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Receive one message from one of the channels."""
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
-        _, message = await wrap_future(
+        message = await wrap_future(
             self.thread.schedule(RECEIVE, self._apply_channel_prefix(channel))
         )
         # If there is a full channel name stored in the message, unpack it.

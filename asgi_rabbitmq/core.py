@@ -31,10 +31,27 @@ DECLARE_DEAD_LETTERS = 6
 EXPIRE_GROUP_MEMBER = 7
 
 
+def _apply_channel_prefix(prefix, channel):
+    return f'{prefix}:{channel}'
+
+
+def _apply_group_prefix(prefix, group):
+    return f'{prefix}:group:{group}'
+
+
+def _strip_channel_prefix(prefix, name):
+    return name[len(_apply_channel_prefix(prefix, '')):]
+
+
+def _strip_group_prefix(prefix, name):
+    return name[len(_apply_group_prefix(prefix, '')):]
+
+
 class Protocol(object):
     """ASGI implementation in the terms of AMQP channel methods."""
 
     dead_letters = 'dead-letters'
+    expire_marker = 'expire.bind.'
     """Name of the protocol dead letters exchange and queue."""
 
     def __init__(self, channel_factory, prefix, expiry, group_expiry,
@@ -58,8 +75,9 @@ class Protocol(object):
         self.unresolved_futures = set()
         self.confirmed_message_number = -1
         self.are_confirmations_enabled = False
-        if prefix:  # Add prefix to the dead-letter queue/exchange
-            self.dead_letters = f'{prefix}.{self.dead_letters}'
+        self.prefix = prefix
+        self.dead_letters = _apply_channel_prefix(prefix, self.dead_letters)
+        self.expire_marker = _apply_channel_prefix(prefix, self.expire_marker)
         self.amqp_channel = channel_factory(self.on_connect)
         # Handle AMQP channel level errors with protocol.
         self.amqp_channel.on_callback_error_callback = self.protocol_error
@@ -401,7 +419,12 @@ class Protocol(object):
     def get_expire_marker(self, group, channel):
         """Get expire marker queue name."""
 
-        return 'expire.bind.%s.%s' % (group, channel)
+        prefix = self.prefix
+        return '%s%s.%s' % (
+            self.expire_marker,
+            _strip_group_prefix(prefix, group),
+            _strip_channel_prefix(prefix, channel),
+        )
 
     def declare_dead_letters(self, future):
         """
@@ -476,7 +499,7 @@ class Protocol(object):
     def is_expire_marker(self, queue):
         """Check if the queue is an expiration marker."""
 
-        return queue.startswith('expire.bind.')
+        return queue.startswith(self.expire_marker)
 
     # Serialization.
 
@@ -905,7 +928,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             pass
 
     def _apply_channel_prefix(self, channel):
-        new_name = f'{self.prefix}{channel}'
+        new_name = _apply_channel_prefix(self.prefix, channel)
         # https://www.rabbitmq.com/resources/specs/amqp0-9-1.pdf
         # Short strings are limited to 255 octets and can be
         # parsed with no risk of buffer overflows.
@@ -913,7 +936,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         return new_name
 
     def _apply_group_prefix(self, group):
-        new_name = f'{self.prefix}:group:{group}'
+        new_name = _apply_group_prefix(self.prefix, group)
         # https://www.rabbitmq.com/resources/specs/amqp0-9-1.pdf
         # Short strings are limited to 255 octets and can be
         # parsed with no risk of buffer overflows.

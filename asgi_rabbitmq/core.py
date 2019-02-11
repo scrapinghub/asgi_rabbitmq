@@ -924,10 +924,17 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Receive one message from the channel."""
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
-        message = await wrap_future(
-            self.thread.schedule(RECEIVE, self._apply_channel_prefix(channel))
-        )
-        return message
+        # Since this method asynchronously waits it may fail due to a
+        # ChannelClosed exception caused by another concurrent call.
+        # We should retry until we get a response or the coroutine is
+        # cancelled.
+        # For now retry a few times to verify that this is safe.
+        for i in range(3):
+            future = self.thread.schedule(RECEIVE, self._apply_channel_prefix(channel))
+            try:
+                return await wrap_future(future)
+            except ChannelClosed:
+                pass
 
     async def new_channel(self, prefix='specific'):
         """Create new single reader channel."""

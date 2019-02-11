@@ -794,7 +794,11 @@ class RabbitmqConnection(object):
         # connection event loop.
         future = Future()
         with self.lock:
-            self.process(get_ident(), (f, args, kwargs, future))
+            # Run each method in it's own channel to isolate receives from
+            # channel exceptions caused by other commands (especially
+            # group_send which is expected to error if the group is empty).
+            ident = (get_ident(), f)
+            self.process(ident, (f, args, kwargs, future))
         return future
 
     @property

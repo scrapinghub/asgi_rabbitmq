@@ -295,9 +295,13 @@ class Protocol(object):
             consumer_tag = self.consumer_tags[queue]
             if (consumer_tag is not None and
                     not self._has_receivers(queue)):
-                self.amqp_channel.basic_cancel(
-                    consumer_tag=consumer_tag,
-                )
+                try:
+                    self.amqp_channel.basic_cancel(
+                        consumer_tag=consumer_tag,
+                    )
+                except ChannelClosed:
+                    pass
+
                 del self.consumer_tags[queue]
 
     def _has_receivers(self, queue):

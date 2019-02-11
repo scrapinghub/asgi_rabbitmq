@@ -915,26 +915,17 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_channel_name(channel), 'Channel name is not valid'
         # Make sure the message does not contain reserved keys
         assert '__asgi_channel__' not in message
-        channel_key = self._apply_channel_prefix(channel)
-        return await wrap_future(
-            self.thread.schedule(SEND, channel_key, message)
+        return await self._schedule_until_success(
+            SEND, self._apply_channel_prefix(channel), message
         )
 
     async def receive(self, channel):
         """Receive one message from the channel."""
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
-        # Since this method asynchronously waits it may fail due to a
-        # ChannelClosed exception caused by another concurrent call.
-        # We should retry until we get a response or the coroutine is
-        # cancelled.
-        # For now retry a few times to verify that this is safe.
-        for i in range(3):
-            future = self.thread.schedule(RECEIVE, self._apply_channel_prefix(channel))
-            try:
-                return await wrap_future(future)
-            except ChannelClosed:
-                pass
+        return await self._schedule_until_success(
+            RECEIVE, self._apply_channel_prefix(channel)
+        )
 
     async def new_channel(self, prefix='specific'):
         """Create new single reader channel."""
@@ -949,44 +940,55 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        while True:
-            future = self.thread.schedule(
-                GROUP_ADD,
-                self._apply_group_prefix(group),
-                self._apply_channel_prefix(channel),
-            )
-            try:
-                return await wrap_future(future)
-            except ChannelClosed:
-                pass
+        return await self._schedule_until_success(
+            GROUP_ADD,
+            self._apply_group_prefix(group),
+            self._apply_channel_prefix(channel),
+        )
 
     async def group_discard(self, group, channel):
         """Remove the channel from the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
-        return await wrap_future(
-            self.thread.schedule(
-                GROUP_DISCARD,
-                self._apply_group_prefix(group),
-                self._apply_channel_prefix(channel),
-            )
+        return await self._schedule_until_success(
+            GROUP_DISCARD,
+            self._apply_group_prefix(group),
+            self._apply_channel_prefix(channel),
         )
 
     async def group_send(self, group, message):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
-        future = self.thread.schedule(
-            SEND_GROUP, self._apply_group_prefix(group), message
-        )
-        try:
-            return await wrap_future(future)
-        except ChannelClosed:
-            # Channel was closed because corresponding group exchange
-            # does not exist yet.  This mean no one call `group_add`
-            # yet, so group is empty and we should not worry about.
-            pass
+        prefixed_group = self._apply_group_prefix(group)
+        while True:
+            future = self.thread.schedule(
+                SEND_GROUP, prefixed_group, message
+            )
+            try:
+                return await wrap_future(future)
+            except ChannelClosed as e:
+                # Channel was closed because corresponding group exchange
+                # does not exist yet.  This mean no one call `group_add`
+                # yet, so group is empty and we should not worry about.
+                if e.args[0] == 404 and f"'{prefixed_group}'" in e.args[1]:
+                    return
+
+    async def _schedule_until_success(self, message, *args):
+        """
+        Since schedule method asynchronously waits it may fail due to a
+        ChannelClosed exception caused by another concurrent call.
+        We should retry until we get a response or the coroutine is
+        cancelled.
+        """
+
+        while True:
+            future = self.thread.schedule(message, *args)
+            try:
+                return await wrap_future(future)
+            except ChannelClosed:
+                pass
 
     def _apply_channel_prefix(self, channel):
         new_name = _apply_channel_prefix(self.prefix, channel)

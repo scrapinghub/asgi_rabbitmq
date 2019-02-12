@@ -52,8 +52,8 @@ class Protocol(object):
     expire_marker = 'expire.bind.'
     """Name of the protocol dead letters exchange and queue."""
 
-    def __init__(self, channel_factory, prefix, expiry, group_expiry,
-                 get_capacity, non_local_name, crypter):
+    def __init__(self, channel_factory, prefix, group_prefix, expiry,
+                 group_expiry, get_capacity, non_local_name, crypter):
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.get_capacity = get_capacity
@@ -78,6 +78,7 @@ class Protocol(object):
         self.waiting_receivers = collections.defaultdict(collections.deque)
         self.consumer_tags = {}
         self.prefix = prefix
+        self.group_prefix = group_prefix
         self.dead_letters = _apply_channel_prefix(prefix, self.dead_letters)
         self.expire_marker = _apply_channel_prefix(prefix, self.expire_marker)
         self.amqp_channel = channel_factory(self.on_connect)
@@ -471,11 +472,10 @@ class Protocol(object):
     def get_expire_marker(self, group, channel):
         """Get expire marker queue name."""
 
-        prefix = self.prefix
         return '%s%s.%s' % (
             self.expire_marker,
-            _strip_group_prefix(prefix, group),
-            _strip_channel_prefix(prefix, channel),
+            _strip_group_prefix(self.group_prefix, group),
+            _strip_channel_prefix(self.prefix, channel),
         )
 
     def declare_dead_letters(self, future):
@@ -663,11 +663,12 @@ class RabbitmqConnection(object):
     Connection = LayerConnection
     Protocol = Protocol
 
-    def __init__(self, url, prefix, expiry, group_expiry, get_capacity,
-                 non_local_name, crypter):
+    def __init__(self, url, prefix, group_prefix, expiry, group_expiry,
+                 get_capacity, non_local_name, crypter):
 
         self.url = url
         self.prefix = prefix
+        self.group_prefix = group_prefix
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.get_capacity = get_capacity
@@ -760,6 +761,7 @@ class RabbitmqConnection(object):
             self.protocols[ident] = self.Protocol(
                 channel_factory=self.connection.channel,
                 prefix=self.prefix,
+                group_prefix=self.group_prefix,
                 expiry=self.expiry,
                 group_expiry=self.group_expiry,
                 get_capacity=self.get_capacity,
@@ -820,14 +822,14 @@ class ConnectionThread(Thread):
 
     Connection = RabbitmqConnection
 
-    def __init__(self, url, prefix, expiry, group_expiry, get_capacity,
-                 non_local_name, crypter):
+    def __init__(self, url, prefix, group_prefix, expiry, group_expiry,
+                 get_capacity, non_local_name, crypter):
 
         super(ConnectionThread, self).__init__()
         self.daemon = True
         self.connection = self.Connection(
-            url, prefix, expiry, group_expiry, get_capacity, non_local_name,
-            crypter,
+            url, prefix, group_prefix, expiry, group_expiry, get_capacity,
+            non_local_name, crypter,
         )
 
     def run(self):
@@ -867,6 +869,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         self,
         url,
         prefix='asgi:',
+        group_prefix=None,
         expiry=60,
         group_expiry=86400,
         capacity=100,
@@ -878,6 +881,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             expiry=expiry, capacity=capacity, channel_capacity=channel_capacity
         )
         self.prefix = prefix
+        self.group_prefix = prefix if group_prefix is None else group_prefix
         self.client_prefix = ''.join(
             random.choice(string.ascii_letters) for i in range(8)
         )
@@ -894,7 +898,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         else:
             crypter = None
         self.thread = self.Thread(
-            url, prefix, expiry, group_expiry, self.get_capacity,
+            url, prefix, group_prefix, expiry, group_expiry, self.get_capacity,
             self.non_local_name, crypter,
         )
         self.thread.start()
@@ -1003,7 +1007,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         return new_name
 
     def _apply_group_prefix(self, group):
-        new_name = _apply_group_prefix(self.prefix, group)
+        new_name = _apply_group_prefix(self.group_prefix, group)
         # https://www.rabbitmq.com/resources/specs/amqp0-9-1.pdf
         # Short strings are limited to 255 octets and can be
         # parsed with no risk of buffer overflows.

@@ -254,32 +254,28 @@ class Protocol(object):
         else:
             channel = queue
 
-        if channel in self.waiting_receivers:
-            channel_receivers = self.waiting_receivers[channel]
+        try:
+            if channel in self.waiting_receivers:
+                channel_receivers = self.waiting_receivers[channel]
 
-            try:
-                while channel_receivers:
-                    future = channel_receivers.popleft()
+                try:
+                    while channel_receivers:
+                        future = channel_receivers.popleft()
 
-                    # Don't allow cancel after we got a message
-                    if future.set_running_or_notify_cancel():
-                        if not self._has_receivers(queue):
-                            amqp_channel.basic_cancel(
-                                consumer_tag=method_frame.consumer_tag,
-                            )
-                            del self.consumer_tags[queue]
-                        amqp_channel.basic_ack(method_frame.delivery_tag)
+                        # Don't allow cancel after we got a message
+                        if future.set_running_or_notify_cancel():
+                            # Send the message to the waiting Future.
+                            future.set_result(self.deserialize(body))
+                            return
+                finally:
+                    if not channel_receivers:
+                        # it might have been removed by a future callback
+                        if channel in self.waiting_receivers:
+                            del self.waiting_receivers[channel]
+        finally:
+            amqp_channel.basic_ack(method_frame.delivery_tag)
 
-                        # Send the message to the waiting Future.
-                        future.set_result(self.deserialize(body))
-                        return
-            finally:
-                if not len(channel_receivers):
-                    # it might have been removed by a future callback
-                    if channel in self.waiting_receivers:
-                        del self.waiting_receivers[channel]
-
-        # otherwise save this message for later
+        # if we didn't resolve a future and return, save this message for later
         self.received_messages[channel].append(self.deserialize(body))
 
     def cancel_receiving(self, channel, future):

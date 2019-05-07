@@ -47,10 +47,6 @@ class RabbitmqChannel(object):
         self.expire_marker = _apply_channel_prefix(prefix, self.expire_marker)
         self.are_confirmations_enabled = False
 
-        # FIXME Do we need the variables?
-        self.messages = {}
-        self.message_number = 0
-        self.unresolved_futures = set()
         self.consumer_tags = {}
 
     async def initialize(self):
@@ -99,71 +95,19 @@ class RabbitmqChannel(object):
     async def receive(self, channel):
         """Initiate message receive."""
 
-        future.add_done_callback(partial(self.cancel_receiving, channel))
-
-        queue = self.non_local_name(channel)
-        if queue not in self.consumer_tags:
-            # reserve the consumer tag
-            self.consumer_tags[queue] = None
-            self.amqp_channel.queue_declare(
-                partial(self.receive_queue_declared, queue),
-                queue,
-                arguments=self.queue_arguments,
-            )
-
-    def receive_queue_declared(self, queue, frame):
-        consumer_tag = self.amqp_channel.basic_consume(
-            partial(self.consume_message, queue),
-            queue=queue,
+        queue_name = self.non_local_name(channel)
+        queue = await self.amqp_channel.declare_queue(
+            queue_name, arguments=self.queue_arguments,
         )
-        self.consumer_tags[queue] = consumer_tag
+        await queue.consume(partial(self.consume_message, queue))
 
-    def consume_message(
-        self, queue, amqp_channel, method_frame, properties, body
-    ):
-        if properties.headers and 'asgi_channel' in properties.headers:
-            channel = queue + properties.headers['asgi_channel']
-        else:
-            channel = queue
-
-        try:
-            if channel in self.waiting_receivers:
-                channel_receivers = self.waiting_receivers[channel]
-
-                try:
-                    while channel_receivers:
-                        future = channel_receivers.popleft()
-
-                        # Don't allow cancel after we got a message
-                        if future.set_running_or_notify_cancel():
-                            # Send the message to the waiting Future.
-                            future.set_result(self.deserialize(body))
-                            return
-                finally:
-                    if not channel_receivers:
-                        # it might have been removed by a future callback
-                        if channel in self.waiting_receivers:
-                            del self.waiting_receivers[channel]
-        finally:
-            amqp_channel.basic_ack(method_frame.delivery_tag)
-
-        # if we didn't resolve a future and return, save this message for later
-        self.received_messages[channel].append(self.deserialize(body))
-
-    def cancel_receiving(self, channel, future):
-        queue = self.non_local_name(channel)
-        if queue in self.consumer_tags:
-            consumer_tag = self.consumer_tags[queue]
-            if (consumer_tag is not None and
-                    not self._has_receivers(queue)):
-                try:
-                    self.amqp_channel.basic_cancel(
-                        consumer_tag=consumer_tag,
-                    )
-                except ChannelClosed:
-                    pass
-
-                del self.consumer_tags[queue]
+    async def consume_message(self, queue, message):
+        channel = queue.name
+        if 'asgi_channel' in message.headers:
+            channel += message.headers['asgi_channel']
+        await queue.cancel(message.consumer_tag)
+        await message.ack()
+        return self.deserialize(message.body)
 
     @property
     def queue_arguments(self):

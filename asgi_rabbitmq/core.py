@@ -3,13 +3,11 @@ import hashlib
 import logging
 import random
 import string
-from concurrent.futures import Future
 from functools import partial
 
 import aio_pika
 import msgpack
 from aio_pika.exchange import ExchangeType
-from asyncio import wrap_future
 from asgiref.sync import async_to_sync
 from channels.exceptions import ChannelFull
 from channels.layers import BaseChannelLayer
@@ -40,8 +38,9 @@ class RabbitmqChannel(object):
     expire_marker = 'expire.bind.'
     """Name of the protocol dead letters exchange and queue."""
 
-    def __init__(self, prefix, group_prefix, expiry,
+    def __init__(self, connection, prefix, group_prefix, expiry,
                  group_expiry, get_capacity, non_local_name, crypter):
+        self.connection = connection
         self.prefix = prefix
         self.group_prefix = group_prefix
         self.dead_letters = _apply_channel_prefix(prefix, self.dead_letters)
@@ -82,45 +81,24 @@ class RabbitmqChannel(object):
     async def publish_message(self, channel, body):
         """Channel capacity check is done.  Publish message."""
         queue = self.non_local_name(channel)
-        asgi_channel = channel.rsplit('!')[-1] if '!' in channel else None
+        headers = {}
+        if '!' in channel:
+            headers['asgi_channel'] = channel.rsplit('!')[-1]
         message = aio_pika.Message(
             body=body,
             expiration=self.expiry,
-            headers={'asgi_channel': asgi_channel} if asgi_channel else {},
+            headers=headers,
         )
         await self.amqp_channel.default_exchange.publish(
             message,
             routing_key=queue,
         )
 
-    def basic_publish(self, **kwargs):
-        if self.are_confirmations_enabled:
-            exchange = self.amqp_channel.default_exchange
-            await exchange.publish(mandatory=True, **kwargs)
-        else:
-            self.amqp_channel.add_callback(
-                lambda unused_frame: self.amqp_channel.basic_publish(
-                    mandatory=True,
-                    **kwargs,
-                ),
-                [Confirm.SelectOk],
-            )
-            self.amqp_channel.confirm_delivery()
-            self.are_confirmations_enabled = True
-
     # Receive.
 
-    async def receive(self, future, channel):
+    async def receive(self, channel):
         """Initiate message receive."""
 
-        if channel in self.received_messages:
-            received = self.received_messages[channel]
-            future.set_result(received.popleft())
-            if not len(received):
-                del self.received_messages[channel]
-            return
-
-        self.waiting_receivers[channel].append(future)
         future.add_done_callback(partial(self.cancel_receiving, channel))
 
         queue = self.non_local_name(channel)
@@ -173,14 +151,6 @@ class RabbitmqChannel(object):
         self.received_messages[channel].append(self.deserialize(body))
 
     def cancel_receiving(self, channel, future):
-        channel_receivers = self.waiting_receivers[channel]
-        try:
-            channel_receivers.remove(future)
-        except ValueError:
-            pass
-        if not channel_receivers:
-            del self.waiting_receivers[channel]
-
         queue = self.non_local_name(channel)
         if queue in self.consumer_tags:
             consumer_tag = self.consumer_tags[queue]
@@ -195,12 +165,6 @@ class RabbitmqChannel(object):
 
                 del self.consumer_tags[queue]
 
-    def _has_receivers(self, queue):
-        return any((self.non_local_name(channel) == queue
-                    and receivers)
-                   for channel, receivers
-                   in self.waiting_receivers.items())
-
     @property
     def queue_arguments(self):
         """Channel queue declaration arguments."""
@@ -212,103 +176,70 @@ class RabbitmqChannel(object):
 
     # Groups.
 
-    async def group_add(self, future, group, channel):
+    async def group_add(self, group, channel):
         """Initiate member addition to the group."""
 
         await self.expire_group_member(group, channel)
-
-        # The last callback.
-        def after_bind(method_frame):
-            future.set_result(None)
 
         if '!' in channel:
             # Process local channels needs its own queue for
             # membership.  This queue will be bound to the group
             # exchange.
-
-            def bind_channel(method_frame):
-
-                self.amqp_channel.queue_bind(
-                    callback=after_bind,
-                    queue=channel,
-                    exchange=group,
-                )
-
-            def declare_member(method_frame):
-
-                self.amqp_channel.queue_declare(
-                    callback=bind_channel,
-                    queue=channel,
-                    arguments={
-                        'x-dead-letter-exchange': self.dead_letters,
-                        'x-expires': self.group_expiry * 1000,
-                        'x-max-length': 0,
-                    },
-                )
+            exchange = await self.amqp_channel.declare_exchange(
+                group,
+                exchange_type=ExchangeType.FANOUT,
+                auto_delete=True,
+            )
+            queue = await self.amqp_channel.declare_queue(
+                channel,
+                arguments={
+                    'x-dead-letter-exchange': self.dead_letters,
+                    'x-expires': self.group_expiry * 1000,
+                    'x-max-length': 0,
+                },
+            )
+            await queue.bind(exchange)
         else:
             # Regular channel and single reader channels needs
             # exchange to exchange binding.  So message will be routed
             # to the queue without dead letters mechanism.
-
-            def bind_channel(method_frame):
-
-                self.amqp_channel.queue_bind(
-                    after_bind,
-                    queue=channel,
-                    exchange=channel,
-                )
-
-            def bind_group(method_frame):
-
-                self.amqp_channel.exchange_bind(
-                    bind_channel,
-                    destination=channel,
-                    source=group,
-                )
-
-            def declare_channel(method_frame):
-
-                self.amqp_channel.queue_declare(
-                    bind_group,
-                    queue=channel,
-                    arguments=self.queue_arguments,
-                )
-
-            def declare_member(method_frame):
-
-                self.amqp_channel.exchange_declare(
-                    declare_channel,
-                    exchange=channel,
-                    exchange_type='fanout',
-                    auto_delete=True,
-                )
-
-        # Declare group exchange and start one of the callback chains
-        # described above.
-        self.amqp_channel.exchange_declare(
-            declare_member,
-            exchange=group,
-            exchange_type='fanout',
-            auto_delete=True,
-        )
+            group_exchange = await self.amqp_channel.declare_exchange(
+                group,
+                exchange_type=ExchangeType.FANOUT,
+                auto_delete=True,
+            )
+            # Declare member
+            channel_exchange = await self.amqp_channel.declare_exchange(
+                channel,
+                exchange_type=ExchangeType.FANOUT,
+                auto_delete=True,
+            )
+            # Declare channel
+            channel_queue = await self.amqp_channel.declare_queue(
+                channel, arguments=self.queue_arguments,
+            )
+            # Bind group
+            await group_exchange.bind(channel_exchange)
+            # Bind channel
+            await channel_queue.bind(channel_exchange)
 
     async def group_discard(self, group, channel):
         """Initiate member removing from the group."""
 
         if '!' in channel:
-            queue = self.amqp_channel.queue_declare(
-
-            self.amqp_channel.queue_unbind(
-                after_unbind,
-                queue=channel,
-                exchange=group,
-            )
+            queue = self.amqp_channel.QUEUE_CLASS(
+                self.connection, self.amqp_channel, channel,
+                # other options are redundant but required by constructor
+                durable=False, exclusive=False, auto_delete=True,
+                arguments=None)
+            await queue.unbind(group)
         else:
-            self.amqp_channel.exchange_unbind(
-                after_unbind,
-                destination=channel,
-                source=group,
+            exchange = self.amqp_channel.EXCHANGE_CLASS(
+                connection=self.connection,
+                channel=self.amqp_channel,
+                name=channel, type=ExchangeType.FANOUT,
             )
+            await exchange.unbind(group)
 
     async def group_send(self, group, message):
         """Publish the message to the group exchange."""
@@ -455,7 +386,7 @@ class RabbitmqConnection(object):
 
     async def get_channel(self):
         channel = RabbitmqChannel(
-            channel_factory=self.connection.channel,
+            connection=self.connection,
             prefix=self.prefix,
             group_prefix=self.group_prefix,
             expiry=self.expiry,
@@ -507,10 +438,11 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         self.connection = self.get_connection(url)
 
     @async_to_sync
-    def get_connection(self, url):
+    async def get_connection(self, url):
         connection = self.Connection(
-            url, self.prefix, self.group_prefix, expiry, group_expiry,
-            self.get_capacity, self.non_local_name, self.crypter
+            url, self.prefix, self.group_prefix, self.expiry,
+            self.group_expiry, self.get_capacity, self.non_local_name,
+            self.crypter
         )
         await connection.initialize()
         return connection
@@ -526,7 +458,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert '__asgi_channel__' not in message
 
         rmq_channel = await self.connection.get_channel()
-        return await rmq_channel.send(chanel, message)
+        return await rmq_channel.send(channel, message)
 
     async def receive(self, channel):
         """Receive one message from the channel."""
@@ -534,7 +466,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_channel_name(channel), fail_msg
 
         rmq_channel = await self.connection.get_channel()
-        return await rmq_channel.receive(chanel)
+        return await rmq_channel.receive(channel)
 
     async def new_channel(self, prefix='specific'):
         """Create new single reader channel."""
@@ -555,7 +487,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             self._apply_group_prefix(group),
             self._apply_channel_prefix(channel),
         )
-
 
     async def group_discard(self, group, channel):
         """Remove the channel from the group."""

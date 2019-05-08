@@ -169,7 +169,7 @@ class RabbitmqChannel(object):
                 channel, arguments=self.queue_arguments,
             )
             # Bind group
-            await group_exchange.bind(channel_exchange)
+            await channel_exchange.bind(group_exchange)
             # Bind channel
             await channel_queue.bind(channel_exchange)
 
@@ -229,6 +229,15 @@ class RabbitmqChannel(object):
             routing_key=self.get_expire_marker(group, channel)
         )
 
+    def get_expire_marker(self, group, channel):
+        """Get expire marker queue name."""
+
+        return '%s%s.%s' % (
+            self.expire_marker,
+            _strip_group_prefix(self.group_prefix, group),
+            _strip_channel_prefix(self.prefix, channel),
+        )
+
     async def declare_dead_letters(self):
         """
         Initiate dead letters processing.  Declare dead letters exchange
@@ -238,6 +247,7 @@ class RabbitmqChannel(object):
         # FIXME is it correct to create a channel here this way?
         dlx_exchange = await self.channel.declare_exchange(
             self.dead_letters,
+
             type=ExchangeType.FANOUT,
             auto_delete=True,
         )
@@ -250,7 +260,7 @@ class RabbitmqChannel(object):
                 ) * 2,
             },
         )
-        await dlx_queue.bind(dlx_exchange, "")
+        await dlx_queue.bind(dlx_exchange)
         await dlx_queue.consume(self.on_dead_letter)
 
     async def on_dead_letter(self, message):
@@ -286,15 +296,6 @@ class RabbitmqChannel(object):
         """Check if the queue is an expiration marker."""
 
         return queue.startswith(self.expire_marker)
-
-    def get_expire_marker(self, group, channel):
-        """Get expire marker queue name."""
-
-        return '%s%s.%s' % (
-            self.expire_marker,
-            _strip_group_prefix(self.group_prefix, group),
-            _strip_channel_prefix(self.prefix, channel),
-        )
 
     # Serialization.
 
@@ -416,7 +417,9 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert '__asgi_channel__' not in message
 
         async with await self.get_channel() as amqp_channel:
-            return await amqp_channel.send(channel, message)
+            return await amqp_channel.send(
+                self._apply_channel_prefix(channel), message
+            )
 
     async def receive(self, channel):
         """Receive one message from the channel."""
@@ -424,7 +427,9 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_channel_name(channel), fail_msg
 
         async with await self.get_channel() as amqp_channel:
-            return await amqp_channel.receive(channel)
+            return await amqp_channel.receive(
+                self._apply_channel_prefix(channel)
+            )
 
     async def new_channel(self, prefix='specific'):
         """Create new single reader channel."""
@@ -462,9 +467,9 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
+        prefixed_group = self._apply_group_prefix(group)
         async with await self.get_channel() as amqp_channel:
             try:
-                prefixed_group = self._apply_group_prefix(group)
                 return await amqp_channel.group_send(prefixed_group, message)
             except ChannelNotFoundEntity:
                 # corresponding group exchange does not exist yet:

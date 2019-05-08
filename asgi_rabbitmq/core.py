@@ -8,7 +8,7 @@ from functools import partial
 import aio_pika
 import msgpack
 from aio_pika.exchange import ExchangeType
-from asgiref.sync import async_to_sync
+from aiormq.exceptions import ChannelNotFoundEntity
 from channels.exceptions import ChannelFull
 from channels.layers import BaseChannelLayer
 
@@ -42,23 +42,20 @@ class RabbitmqChannel(object):
                  group_expiry, get_capacity, non_local_name, crypter):
         self.connection = connection
         self.prefix = prefix
+        self.expiry = expiry
+        self.group_expiry = group_expiry
         self.group_prefix = group_prefix
+        self.get_capacity = get_capacity
+        self.non_local_name = non_local_name
+        self.crypter = crypter
         self.dead_letters = _apply_channel_prefix(prefix, self.dead_letters)
         self.expire_marker = _apply_channel_prefix(prefix, self.expire_marker)
-        self.are_confirmations_enabled = False
-
-        self.consumer_tags = {}
 
     async def initialize(self):
         self.amqp_channel = await self.connection.channel()
         # set prefetch count for the channel to prevent redelivery
         # amplification when the consumer stops consuming after each message
-        await self.amqp_channel.set_qos(
-            prefetch_count=1,
-            # in RabbitMQ this is actually all consumers on the channel
-            # https://www.rabbitmq.com def/consumer-prefetch.html
-            all_channels=True,
-        )
+        await self.amqp_channel.set_qos(prefetch_count=1)
 
     # Send.
 
@@ -66,7 +63,7 @@ class RabbitmqChannel(object):
         """Start message sending.  Declare necessary queue first."""
 
         queue = self.non_local_name(channel)
-        declare_result = await self.amqp_channel.queue_declare(
+        declare_result = await self.amqp_channel.declare_queue(
             queue, arguments=self.queue_arguments,
         )
         if declare_result.message_count >= self.get_capacity(channel):
@@ -94,20 +91,30 @@ class RabbitmqChannel(object):
 
     async def receive(self, channel):
         """Initiate message receive."""
-
         queue_name = self.non_local_name(channel)
+        future = self.connection.loop.create_future()
         queue = await self.amqp_channel.declare_queue(
             queue_name, arguments=self.queue_arguments,
         )
-        await queue.consume(partial(self.consume_message, queue))
+        future.add_done_callback(
+            partial(self.cancel_receiving, queue)
+        )
+        await queue.consume(
+            partial(self.consume_message, queue, future)
+        )
+        return await future
 
-    async def consume_message(self, queue, message):
+    async def consume_message(self, queue, future, message):
         channel = queue.name
         if 'asgi_channel' in message.headers:
             channel += message.headers['asgi_channel']
         await queue.cancel(message.consumer_tag)
         await message.ack()
-        return self.deserialize(message.body)
+        if not future.cancelled():
+            future.set_result(self.deserialize(message.body))
+
+    def cancel_receiving(self, queue, future):
+        self.connection.loop.create_task(queue.cancel(queue.name))
 
     @property
     def queue_arguments(self):
@@ -131,7 +138,7 @@ class RabbitmqChannel(object):
             # exchange.
             exchange = await self.amqp_channel.declare_exchange(
                 group,
-                exchange_type=ExchangeType.FANOUT,
+                type=ExchangeType.FANOUT,
                 auto_delete=True,
             )
             queue = await self.amqp_channel.declare_queue(
@@ -149,13 +156,13 @@ class RabbitmqChannel(object):
             # to the queue without dead letters mechanism.
             group_exchange = await self.amqp_channel.declare_exchange(
                 group,
-                exchange_type=ExchangeType.FANOUT,
+                type=ExchangeType.FANOUT,
                 auto_delete=True,
             )
             # Declare member
             channel_exchange = await self.amqp_channel.declare_exchange(
                 channel,
-                exchange_type=ExchangeType.FANOUT,
+                type=ExchangeType.FANOUT,
                 auto_delete=True,
             )
             # Declare channel
@@ -172,16 +179,17 @@ class RabbitmqChannel(object):
 
         if '!' in channel:
             queue = self.amqp_channel.QUEUE_CLASS(
-                self.connection, self.amqp_channel, channel,
+                self.connection, self.amqp_channel.channel, channel,
                 # other options are redundant but required by constructor
                 durable=False, exclusive=False, auto_delete=True,
                 arguments=None)
             await queue.unbind(group)
         else:
             exchange = self.amqp_channel.EXCHANGE_CLASS(
-                connection=self.connection,
-                channel=self.amqp_channel,
-                name=channel, type=ExchangeType.FANOUT,
+                self.connection, self.amqp_channel.channel, channel,
+                ExchangeType.FANOUT,
+                # other options are redundant but required by constructor
+                auto_delete=True, durable=False, internal=False, passive=False
             )
             await exchange.unbind(group)
 
@@ -190,7 +198,12 @@ class RabbitmqChannel(object):
 
         body = self.serialize(message)
         message = aio_pika.Message(body=body, expiration=self.expiry)
-        exchange = await self.amqp_channel.declare_exchange(group)
+        exchange = self.amqp_channel.EXCHANGE_CLASS(
+            self.connection, self.amqp_channel.channel, group,
+            type=ExchangeType.FANOUT,
+            # other options are redundant but required by constructor
+            auto_delete=True, durable=False, internal=False, passive=False
+        )
         await exchange.publish(message, routing_key='')
 
     # Dead letters processing.
@@ -218,6 +231,30 @@ class RabbitmqChannel(object):
             aio_pika.Message(body=body),
             routing_key=self.get_expire_marker(group, channel)
         )
+
+    async def declare_dead_letters(self):
+        """
+        Initiate dead letters processing.  Declare dead letters exchange
+        and queue.  Bind them together.  Start dead letter consumer.
+        """
+
+        # FIXME is it correct to create a channel here this way?
+        dlx_exchange = await self.amqp_channel.declare_exchange(
+            self.dead_letters,
+            type=ExchangeType.FANOUT,
+            auto_delete=True,
+        )
+        dlx_queue = await self.amqp_channel.declare_queue(
+            self.dead_letters,
+            arguments={
+                'x-expires': max(
+                    self.expiry * 2000,
+                    self.group_expiry * 1000,
+                ) * 2,
+            },
+        )
+        await dlx_queue.bind(dlx_exchange, "")
+        await dlx_queue.consume(self.on_dead_letter)
 
     async def on_dead_letter(self, message):
         """Consumer callback for messages from the dead letter exchange."""
@@ -283,6 +320,8 @@ class RabbitmqChannel(object):
 class RabbitmqConnection(object):
     """RabbitMQ connection wrapper."""
 
+    Channel = RabbitmqChannel
+
     def __init__(self, url, prefix, group_prefix, expiry, group_expiry,
                  get_capacity, non_local_name, crypter):
 
@@ -295,41 +334,15 @@ class RabbitmqConnection(object):
         self.non_local_name = non_local_name
         self.crypter = crypter
 
-    @async_to_sync
     async def initialize(self):
         """Prepare connection state."""
 
-        self.connection = await aio_pika.robust_connect(self.url)
-        await self.connection.declare_dead_letters()
-
-    @async_to_sync
-    async def declare_dead_letters(self):
-        """
-        Initiate dead letters processing.  Declare dead letters exchange
-        and queue.  Bind them together.  Start dead letter consumer.
-        """
-
-        # FIXME is it correct to create a channel here this way?
-        channel = await self.connection.channel()
-        dlx_exchange = await channel.declare_exchange(
-            self.dead_letters,
-            type=ExchangeType.FANOUT,
-            auto_delete=True,
-        )
-        dlx_queue = await channel.queue_declare(
-            self.dead_letters,
-            arguments={
-                'x-expires': max(
-                    self.expiry * 2000,
-                    self.group_expiry * 1000,
-                ) * 2,
-            },
-        )
-        await dlx_queue.bind(dlx_exchange, "")
-        await dlx_queue.consume(self.connection.on_dead_letter)
+        self.connection = await aio_pika.connect_robust(self.url)
+        channel = await self.get_channel()
+        await channel.declare_dead_letters()
 
     async def get_channel(self):
-        channel = RabbitmqChannel(
+        channel = self.Channel(
             connection=self.connection,
             prefix=self.prefix,
             group_prefix=self.group_prefix,
@@ -347,7 +360,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     """
     RabbitMQ channel layer.
 
-    It routes all messages into remote RabbitMQ server. Support for
+    It routes all messages into reote RabbitMQ server. Support for
     RabbitMQ cluster and message encryption are provided.
     """
 
@@ -370,6 +383,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         super(RabbitmqChannelLayer, self).__init__(
             expiry=expiry, capacity=capacity, channel_capacity=channel_capacity
         )
+        self.url = url
         self.prefix = prefix
         self.group_prefix = prefix if group_prefix is None else group_prefix
         self.client_prefix = ''.join(
@@ -378,18 +392,19 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.crypter = self.make_crypter(symmetric_encryption_keys)
+        self._connection = None
 
-        self.connection = self.get_connection(url)
-
-    @async_to_sync
-    async def get_connection(self, url):
-        connection = self.Connection(
-            url, self.prefix, self.group_prefix, self.expiry,
-            self.group_expiry, self.get_capacity, self.non_local_name,
-            self.crypter
-        )
-        await connection.initialize()
-        return connection
+    async def get_channel(self):
+        # create and initialize connection if not set yet
+        if not self._connection:
+            connection = self.Connection(
+                self.url, self.prefix, self.group_prefix, self.expiry,
+                self.group_expiry, self.get_capacity, self.non_local_name,
+                self.crypter
+            )
+            await connection.initialize()
+            self._connection = connection
+        return await self._connection.get_channel()
 
     # API
 
@@ -401,7 +416,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         # Make sure the message does not contain reserved keys
         assert '__asgi_channel__' not in message
 
-        rmq_channel = await self.connection.get_channel()
+        rmq_channel = await self.get_channel()
         return await rmq_channel.send(channel, message)
 
     async def receive(self, channel):
@@ -409,7 +424,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
 
-        rmq_channel = await self.connection.get_channel()
+        rmq_channel = await self.get_channel()
         return await rmq_channel.receive(channel)
 
     async def new_channel(self, prefix='specific'):
@@ -426,7 +441,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
-        rmq_channel = await self.connection.get_channel()
+        rmq_channel = await self.get_channel()
         return await rmq_channel.group_add(
             self._apply_group_prefix(group),
             self._apply_channel_prefix(channel),
@@ -438,7 +453,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
-        rmq_channel = await self.connection.get_channel()
+        rmq_channel = await self.get_channel()
         return await rmq_channel.group_discard(
             self._apply_group_prefix(group),
             self._apply_channel_prefix(channel),
@@ -448,11 +463,14 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
-
-        rmq_channel = await self.connection.get_channel()
-        return await rmq_channel.group_send(
-            self._apply_group_prefix(group), message
-        )
+        rmq_channel = await self.get_channel()
+        try:
+            prefixed_group = self._apply_group_prefix(group)
+            return await rmq_channel.group_send(prefixed_group, message)
+        except ChannelNotFoundEntity:
+            # corresponding group exchange does not exist yet:
+            # no one called `group_add` yet, so group is empty
+            pass
 
     # Crypto helpers.
 

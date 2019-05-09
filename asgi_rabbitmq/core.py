@@ -60,7 +60,8 @@ class RabbitmqChannel(object):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return await self.channel.__aexit__(exc_type, exc_val, exc_tb)
+        # don't close channel to continue consuming
+        pass
 
     # Send.
 
@@ -137,13 +138,13 @@ class RabbitmqChannel(object):
 
         await self.expire_group_member(group, channel)
 
+        group_exchange = await self.channel.declare_exchange(
+            group, ExchangeType.FANOUT, auto_delete=True,
+        )
         if '!' in channel:
             # Process local channels needs its own queue for
             # membership.  This queue will be bound to the group
             # exchange.
-            exchange = await self.channel.declare_exchange(
-                group, ExchangeType.FANOUT, auto_delete=True,
-            )
             queue = await self.channel.declare_queue(
                 channel,
                 arguments={
@@ -152,26 +153,23 @@ class RabbitmqChannel(object):
                     'x-max-length': 0,
                 },
             )
-            await queue.bind(exchange)
+            await queue.bind(group_exchange)
         else:
             # Regular channel and single reader channels needs
             # exchange to exchange binding.  So message will be routed
             # to the queue without dead letters mechanism.
-            group_exchange = await self.channel.declare_exchange(
-                group, ExchangeType.FANOUT, auto_delete=True,
-            )
             # Declare member
-            channel_exchange = await self.channel.declare_exchange(
+            exchange = await self.channel.declare_exchange(
                 channel, ExchangeType.FANOUT, auto_delete=True,
             )
             # Declare channel
-            channel_queue = await self.channel.declare_queue(
+            queue = await self.channel.declare_queue(
                 channel, arguments=self.queue_arguments,
             )
             # Bind group
-            await channel_exchange.bind(group_exchange)
+            await exchange.bind(group_exchange)
             # Bind channel
-            await channel_queue.bind(channel_exchange)
+            await queue.bind(exchange)
 
     async def group_discard(self, group, channel):
         """Initiate member removing from the group."""
@@ -247,7 +245,6 @@ class RabbitmqChannel(object):
         # FIXME is it correct to create a channel here this way?
         dlx_exchange = await self.channel.declare_exchange(
             self.dead_letters,
-
             type=ExchangeType.FANOUT,
             auto_delete=True,
         )
@@ -265,32 +262,39 @@ class RabbitmqChannel(object):
 
     async def on_dead_letter(self, message):
         """Consumer callback for messages from the dead letter exchange."""
-
-        await message.ack()
-        # Take the most recent death reason.
-        queue = message.headers['x-death'][0]['queue']
-        reason = message.headers['x-death'][0]['reason']
-        if reason == 'expired' and self.is_expire_marker(queue):
-            # Group membership expired.  Discard it.
-            message_body = self.deserialize(message.body)
-            group = message_body['group']
-            channel = message_body['channel']
-            await self.group_discard(group, channel)
-        elif reason == 'expired' and not self.is_expire_marker(queue):
-            # The message was expired in the channel.  Discard all
-            # group membership for this channel.
-            if '!' in queue:
-                queue = queue + message.headers['asgi_channel']
-                await message.channel.queue_delete(queue)
+        logger.info(f'on dead letter called for {message}')
+        async with message.process():
+            # Take the most recent death reason.
+            queue = message.headers['x-death'][0]['queue'].decode('utf8')
+            reason = message.headers['x-death'][0]['reason'].decode('utf8')
+            if reason == 'expired' and self.is_expire_marker(queue):
+                # Group membership expired.  Discard it.
+                message_body = self.deserialize(message.body)
+                group = message_body['group']
+                channel = message_body['channel']
+                logger.info(f'-> discarding {group} for {channel}')
+                await self.group_discard(group, channel)
+            elif reason == 'expired' and not self.is_expire_marker(queue):
+                # The message was expired in the channel.  Discard all
+                # group membership for this channel.
+                logger.info(f'-> deleting exchange or queue')
+                if '!' in queue:
+                    channel = message.headers['asgi_channel'].decode('utf8')
+                    queue = queue + channel
+                    await self.channel.queue_delete(queue)
+                else:
+                    await self.channel.exchange_delete(queue)
+            elif reason == 'maxlen' and self.is_expire_marker(queue):
+                # Existing group membership was updated second time.
+                logger.info(f'-> skipping expire marker')
+                return
+            elif reason == 'maxlen' and '!' in queue:
+                # Send group method was applied to the process local
+                # channel.  Redeliver message to the right queue.
+                logger.info(f'-> republished to {queue}')
+                await self.publish_message(queue, message.body)
             else:
-                await message.channel.exchange_delete(queue)
-        elif reason == 'maxlen' and self.is_expire_marker(queue):
-            # Existing group membership was updated second time.
-            return
-        elif reason == 'maxlen' and '!' in queue:
-            # Send group method was applied to the process local
-            # channel.  Redeliver message to the right queue.
-            await self.publish_message(queue, message.body)
+                logger.info(f'-> ignored')
 
     def is_expire_marker(self, queue):
         """Check if the queue is an expiration marker."""
@@ -410,6 +414,9 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
     async def send(self, channel, message):
         """Send the message to the channel."""
+
+        logger.info(f'send {channel} {message}')
+
         # Typecheck
         assert isinstance(message, dict), 'message is not a dict'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
@@ -423,13 +430,18 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
     async def receive(self, channel):
         """Receive one message from the channel."""
+
+        logger.info(f'receive {channel}')
+
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
 
         async with await self.get_channel() as amqp_channel:
-            return await amqp_channel.receive(
+            result = await amqp_channel.receive(
                 self._apply_channel_prefix(channel)
             )
+            logger.info(f'received from {channel} {result}')
+            return result
 
     async def new_channel(self, prefix='specific'):
         """Create new single reader channel."""
@@ -441,6 +453,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
     async def group_add(self, group, channel):
         """Add channel to the group."""
+        logger.info(f'group-add {group} {channel}')
 
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
@@ -454,6 +467,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     async def group_discard(self, group, channel):
         """Remove the channel from the group."""
 
+        logger.info(f'group-discard {group} {channel}')
+
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
@@ -465,6 +480,8 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
     async def group_send(self, group, message):
         """Send the message to the group."""
+
+        logger.info(f'group-send {group} {message}')
 
         assert self.valid_group_name(group), 'Group name is not valid'
         prefixed_group = self._apply_group_prefix(group)

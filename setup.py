@@ -15,9 +15,9 @@ setup(
     maintainer_email='proofit404@gmail.com',
     packages=find_packages(),
     install_requires=[
-        'pika~=0.10.0',
-        'asgiref~=2.3.0',
-        'channels~=2.1.6',
+        'aio-pika~=5.5.3',
+        'asgiref~=3.1.2',
+        'channels~=2.2.0',
         'msgpack-python',
         'cached-property',
         'futures ; python_version < "3.0"',

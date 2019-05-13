@@ -40,7 +40,8 @@ class RabbitmqChannel(object):
     """Name of the protocol dead letters exchange and queue."""
 
     def __init__(self, connection, prefix, group_prefix, expiry,
-                 group_expiry, get_capacity, non_local_name, crypter):
+                 group_expiry, get_capacity, non_local_name, crypter,
+                 close_after=True):
         self.channel = connection.channel()
         self.prefix = prefix
         self.expiry = expiry
@@ -49,6 +50,7 @@ class RabbitmqChannel(object):
         self.get_capacity = get_capacity
         self.non_local_name = non_local_name
         self.crypter = crypter
+        self.close_after = close_after
         self.dead_letters = _apply_channel_prefix(prefix, self.dead_letters)
         self.expire_marker = _apply_channel_prefix(prefix, self.expire_marker)
 
@@ -60,8 +62,8 @@ class RabbitmqChannel(object):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # don't close channel to continue consuming
-        pass
+        if self.close_after:
+            await self.channel.__aexit__(exc_type, exc_val, exc_tb)
 
     # Send.
 
@@ -262,7 +264,6 @@ class RabbitmqChannel(object):
 
     async def on_dead_letter(self, message):
         """Consumer callback for messages from the dead letter exchange."""
-        logger.info(f'on dead letter called for {message}')
         async with message.process():
             # Take the most recent death reason.
             queue = message.headers['x-death'][0]['queue'].decode('utf8')
@@ -272,12 +273,10 @@ class RabbitmqChannel(object):
                 message_body = self.deserialize(message.body)
                 group = message_body['group']
                 channel = message_body['channel']
-                logger.info(f'-> discarding {group} for {channel}')
                 await self.group_discard(group, channel)
             elif reason == 'expired' and not self.is_expire_marker(queue):
                 # The message was expired in the channel.  Discard all
                 # group membership for this channel.
-                logger.info(f'-> deleting exchange or queue')
                 if '!' in queue:
                     channel = message.headers['asgi_channel'].decode('utf8')
                     queue = queue + channel
@@ -286,15 +285,11 @@ class RabbitmqChannel(object):
                     await self.channel.exchange_delete(queue)
             elif reason == 'maxlen' and self.is_expire_marker(queue):
                 # Existing group membership was updated second time.
-                logger.info(f'-> skipping expire marker')
                 return
             elif reason == 'maxlen' and '!' in queue:
                 # Send group method was applied to the process local
                 # channel.  Redeliver message to the right queue.
-                logger.info(f'-> republished to {queue}')
                 await self.publish_message(queue, message.body)
-            else:
-                logger.info(f'-> ignored')
 
     def is_expire_marker(self, queue):
         """Check if the queue is an expiration marker."""
@@ -342,7 +337,7 @@ class RabbitmqConnection(object):
         rmq_connection = await aio_pika.connect_robust(url)
         connection = cls(rmq_connection, *args, **kwargs)
         # declare & bind dead-letters queue/exchange
-        async with connection.get_channel() as channel:
+        async with connection.get_channel(close_after=False) as channel:
             await channel.declare_dead_letters()
         return connection
 
@@ -351,11 +346,11 @@ class RabbitmqConnection(object):
             await asyncio.sleep(0)
         return await self.connection.ready()
 
-    def get_channel(self):
+    def get_channel(self, close_after=True):
         return self.Channel(
             self.connection, self.prefix, self.group_prefix, self.expiry,
             self.group_expiry, self.get_capacity, self.non_local_name,
-            self.crypter,
+            self.crypter, close_after,
         )
 
 
@@ -415,8 +410,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     async def send(self, channel, message):
         """Send the message to the channel."""
 
-        logger.info(f'send {channel} {message}')
-
         # Typecheck
         assert isinstance(message, dict), 'message is not a dict'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
@@ -431,8 +424,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     async def receive(self, channel):
         """Receive one message from the channel."""
 
-        logger.info(f'receive {channel}')
-
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
 
@@ -440,7 +431,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
             result = await amqp_channel.receive(
                 self._apply_channel_prefix(channel)
             )
-            logger.info(f'received from {channel} {result}')
             return result
 
     async def new_channel(self, prefix='specific'):
@@ -453,8 +443,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
     async def group_add(self, group, channel):
         """Add channel to the group."""
-        logger.info(f'group-add {group} {channel}')
-
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
@@ -467,8 +455,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     async def group_discard(self, group, channel):
         """Remove the channel from the group."""
 
-        logger.info(f'group-discard {group} {channel}')
-
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
@@ -480,8 +466,6 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
     async def group_send(self, group, message):
         """Send the message to the group."""
-
-        logger.info(f'group-send {group} {message}')
 
         assert self.valid_group_name(group), 'Group name is not valid'
         prefixed_group = self._apply_group_prefix(group)

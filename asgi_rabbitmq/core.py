@@ -124,7 +124,6 @@ class Channel(object):
     def cancel_receiving(self, queue, future):
         if not self.channel.is_closed:
             asyncio.create_task(queue.cancel(queue.name))
-            asyncio.create_task(self.channel.close())
 
     @property
     def queue_arguments(self):
@@ -432,7 +431,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
 
-        async with self.connection.get_channel(close_after=False) as amqp_channel:
+        async with self.connection.get_channel() as amqp_channel:
             result = await amqp_channel.receive(
                 self._apply_channel_prefix(channel)
             )

@@ -35,13 +35,6 @@ def _strip_group_prefix(prefix, name):
     return name[len(_apply_group_prefix(prefix, '')):]
 
 
-def run_with_channel_event_loop(func):
-    @wraps(func)
-    async def wrapped(channel, *args, **kwargs):
-        return await channel.loop.create_task(func(channel, *args, **kwargs))
-    return wrapped
-
-
 class Channel(object):
 
     dead_letters = 'dead-letters'
@@ -129,7 +122,9 @@ class Channel(object):
             future.set_result(self.deserialize(message.body))
 
     def cancel_receiving(self, queue, future):
-        self.channel._connection.loop.create_task(queue.cancel(queue.name))
+        if not self.channel.is_closed:
+            asyncio.create_task(queue.cancel(queue.name))
+            asyncio.create_task(self.channel.close())
 
     @property
     def queue_arguments(self):
@@ -367,9 +362,9 @@ class ConnectionManager:
             raise
 
     @asynccontextmanager
-    async def get_channel(self):
+    async def get_channel(self, close_after=True):
         async with self.get_connection() as connection:
-            async with self.channel(connection) as channel:
+            async with self.channel(connection, close_after) as channel:
                 yield channel
 
 
@@ -437,7 +432,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
 
-        async with self.connection.get_channel() as amqp_channel:
+        async with self.connection.get_channel(close_after=False) as amqp_channel:
             result = await amqp_channel.receive(
                 self._apply_channel_prefix(channel)
             )

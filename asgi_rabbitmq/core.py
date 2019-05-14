@@ -3,7 +3,8 @@ import hashlib
 import logging
 import random
 import string
-from functools import partial
+from contextlib import asynccontextmanager
+from functools import partial, wraps
 
 import asyncio
 import aio_pika
@@ -12,6 +13,8 @@ from aio_pika.exchange import ExchangeType
 from aiormq.exceptions import ChannelNotFoundEntity
 from channels.exceptions import ChannelFull
 from channels.layers import BaseChannelLayer
+
+from .connection import ConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +35,14 @@ def _strip_group_prefix(prefix, name):
     return name[len(_apply_group_prefix(prefix, '')):]
 
 
-class RabbitmqChannel(object):
-    """ASGI implementation as RabbitMQ channel wrapper."""
+def run_with_channel_event_loop(func):
+    @wraps(func)
+    async def wrapped(channel, *args, **kwargs):
+        return await channel.loop.create_task(func(channel, *args, **kwargs))
+    return wrapped
+
+
+class Channel(object):
 
     dead_letters = 'dead-letters'
     expire_marker = 'expire.bind.'
@@ -55,15 +64,13 @@ class RabbitmqChannel(object):
         self.expire_marker = _apply_channel_prefix(prefix, self.expire_marker)
 
     async def __aenter__(self):
-        opened_channel = await self.channel.__aenter__()
-        # set prefetch count for the channel to prevent redelivery
-        # amplification when the consumer stops consuming after each message
-        await opened_channel.set_qos(prefetch_count=1)
+        await self.channel.initialize()
+        await self.channel.set_qos(prefetch_count=1)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.close_after:
-            await self.channel.__aexit__(exc_type, exc_val, exc_tb)
+            await self.channel.close()
 
     # Send.
 
@@ -314,15 +321,15 @@ class RabbitmqChannel(object):
         return msgpack.unpackb(message, raw=False)
 
 
-class RabbitmqConnection(object):
+class ConnectionManager:
     """RabbitMQ connection wrapper."""
 
-    Channel = RabbitmqChannel
+    Channel = Channel
 
-    def __init__(self, connection, prefix, group_prefix, expiry, group_expiry,
+    def __init__(self, url, prefix, group_prefix, expiry, group_expiry,
                  get_capacity, non_local_name, crypter):
 
-        self.connection = connection
+        self.connection_pool = ConnectionPool(url)
         self.prefix = prefix
         self.expiry = expiry
         self.group_prefix = group_prefix
@@ -331,27 +338,45 @@ class RabbitmqConnection(object):
         self.non_local_name = non_local_name
         self.crypter = crypter
 
-    @classmethod
-    async def get_connection(cls, url, *args, **kwargs):
-        """Prepare connection state."""
-        rmq_connection = await aio_pika.connect_robust(url)
-        connection = cls(rmq_connection, *args, **kwargs)
-        # declare & bind dead-letters queue/exchange
-        async with connection.get_channel(close_after=False) as channel:
-            await channel.declare_dead_letters()
-        return connection
+        self.is_initialized = False
+        self.lock = asyncio.Lock()
 
-    async def ready(self):
-        while not self.connection:
-            await asyncio.sleep(0)
-        return await self.connection.ready()
+    async def initialize_connection(self, connection):
+        async with self.lock:
+            if not self.is_initialized:
+                dl_channel = self.channel(connection, close_after=False)
+                async with dl_channel as channel:
+                    await channel.declare_dead_letters()
+                    self.is_initialized = True
 
-    def get_channel(self, close_after=True):
+    def channel(self, connection, close_after=True):
         return self.Channel(
-            self.connection, self.prefix, self.group_prefix, self.expiry,
+            connection, self.prefix, self.group_prefix, self.expiry,
             self.group_expiry, self.get_capacity, self.non_local_name,
-            self.crypter, close_after,
+            self.crypter, close_after=close_after,
         )
+
+    @asynccontextmanager
+    async def get_connection(self):
+        connection = await self.connection_pool.pop()
+        await self.initialize_connection(connection)
+        is_connection_error = False
+        try:
+            yield connection
+        except Exception:
+            is_connection_error = True
+            raise
+        finally:
+            if is_connection_error:
+                await self.connection_pool.conn_error(connection)
+            else:
+                self.connection_pool.push(connection)
+
+    @asynccontextmanager
+    async def get_channel(self):
+        async with self.get_connection() as connection:
+            async with self.channel(connection) as channel:
+                yield channel
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):
@@ -362,7 +387,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     RabbitMQ cluster and message encryption are provided.
     """
 
-    Connection = RabbitmqConnection
+    ConnectionManager = ConnectionManager
 
     extensions = ['groups']
 
@@ -390,20 +415,11 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.crypter = self.make_crypter(symmetric_encryption_keys)
-        self.connection = None
-        self.connection_lock = asyncio.Lock()
-
-    async def get_channel(self):
-        # create and initialize connection if not set yet
-        async with self.connection_lock:
-            if not self.connection:
-                self.connection = await self.Connection.get_connection(
-                    self.url, self.prefix, self.group_prefix, self.expiry,
-                    self.group_expiry, self.get_capacity, self.non_local_name,
-                    self.crypter
-                )
-        await self.connection.ready()
-        return self.connection.get_channel()
+        self.connection = self.ConnectionManager(
+            self.url, self.prefix, self.group_prefix, self.expiry,
+            self.group_expiry, self.get_capacity, self.non_local_name,
+            self.crypter
+        )
 
     # API
 
@@ -416,7 +432,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         # Make sure the message does not contain reserved keys
         assert '__asgi_channel__' not in message
 
-        async with await self.get_channel() as amqp_channel:
+        async with self.connection.get_channel() as amqp_channel:
             return await amqp_channel.send(
                 self._apply_channel_prefix(channel), message
             )
@@ -427,7 +443,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
 
-        async with await self.get_channel() as amqp_channel:
+        async with self.connection.get_channel() as amqp_channel:
             result = await amqp_channel.receive(
                 self._apply_channel_prefix(channel)
             )
@@ -446,7 +462,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
-        async with await self.get_channel() as amqp_channel:
+        async with self.connection.get_channel() as amqp_channel:
             return await amqp_channel.group_add(
                 self._apply_group_prefix(group),
                 self._apply_channel_prefix(channel),
@@ -458,7 +474,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
-        async with await self.get_channel() as amqp_channel:
+        async with self.connection.get_channel() as amqp_channel:
             return await amqp_channel.group_discard(
                 self._apply_group_prefix(group),
                 self._apply_channel_prefix(channel),
@@ -469,7 +485,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
 
         assert self.valid_group_name(group), 'Group name is not valid'
         prefixed_group = self._apply_group_prefix(group)
-        async with await self.get_channel() as amqp_channel:
+        async with self.connection.get_channel() as amqp_channel:
             try:
                 return await amqp_channel.group_send(prefixed_group, message)
             except ChannelNotFoundEntity:

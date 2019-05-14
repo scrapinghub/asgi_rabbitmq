@@ -358,19 +358,13 @@ class ConnectionManager:
 
     @asynccontextmanager
     async def get_connection(self):
-        connection = await self.connection_pool.pop()
+        connection = await self.connection_pool.get()
         await self.initialize_connection(connection)
-        is_connection_error = False
         try:
             yield connection
         except Exception:
-            is_connection_error = True
+            await self.connection_pool.conn_error(connection)
             raise
-        finally:
-            if is_connection_error:
-                await self.connection_pool.conn_error(connection)
-            else:
-                self.connection_pool.push(connection)
 
     @asynccontextmanager
     async def get_channel(self):

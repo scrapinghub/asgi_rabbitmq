@@ -3,6 +3,7 @@ import hashlib
 import logging
 import random
 import string
+import types
 from contextlib import asynccontextmanager
 from functools import partial
 
@@ -13,8 +14,6 @@ from aio_pika.exchange import ExchangeType
 from aiormq.exceptions import ChannelNotFoundEntity, ChannelClosed
 from channels.exceptions import ChannelFull
 from channels.layers import BaseChannelLayer
-
-from .connection import ConnectionPool
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +314,22 @@ class Channel(object):
         return msgpack.unpackb(message, raw=False)
 
 
+def _wrap_close_loop(loop, manager):
+    """Decorate an event loop's close method with our own."""
+
+    original_impl = loop.close
+
+    def _wrapper(self, *args, **kwargs):
+        # If the event loop was closed, there's nothing we can do anymore.
+        if not self.is_closed():
+            self.run_until_complete(manager.close_loop(self))
+        # Restore the original close() implementation after we're done.
+        self.close = original_impl
+        return self.close(*args, **kwargs)
+
+    loop.close = types.MethodType(_wrapper, loop)
+
+
 class ConnectionManager:
     """RabbitMQ connection wrapper."""
 
@@ -331,14 +346,32 @@ class ConnectionManager:
         self.get_capacity = get_capacity
         self.non_local_name = non_local_name
         self.crypter = crypter
+        self.connections = {}
         self.lock = asyncio.Lock()
-        self.connection_pool = ConnectionPool(self)
 
-    async def new_connection(self, loop):
-        connection = await aio_pika.connect_robust(self.url, loop=loop)
-        async with self.new_channel(connection, close_after=False) as channel:
-            await channel.declare_dead_letters()
-        return connection
+    # API
+
+    async def get_connection(self, loop=None):
+        """Get a connection for the given identifier and loop."""
+
+        if loop is None:
+            loop = asyncio.get_event_loop()
+        async with self.lock:
+            if loop not in self.connections:
+                # Swap the loop's close method with our own so we get
+                # a chance to do some cleanup.
+                _wrap_close_loop(loop, self)
+                conn = await self.new_connection(loop)
+                self.connections[loop] = conn
+        return self.connections[loop]
+
+    @asynccontextmanager
+    async def get_channel(self, close_after=True):
+        connection = await self.get_connection()
+        async with self.new_channel(connection, close_after) as channel:
+            yield channel
+
+    # Helpers
 
     def new_channel(self, connection, close_after=True):
         return self.Channel(
@@ -347,11 +380,19 @@ class ConnectionManager:
             self.crypter, close_after=close_after,
         )
 
-    @asynccontextmanager
-    async def get_channel(self, close_after=True):
-        connection = await self.connection_pool.get()
-        async with self.new_channel(connection, close_after) as channel:
-            yield channel
+    async def new_connection(self, loop):
+        connection = await aio_pika.connect_robust(self.url, loop=loop)
+        async with self.new_channel(connection, close_after=False) as channel:
+            await channel.declare_dead_letters()
+        return connection
+
+    async def close_loop(self, loop):
+        """Close a connection owned by the pool on the given loop."""
+
+        async with self.lock:
+            if loop in self.connections:
+                await self.connections[loop].close()
+                del self.connections[loop]
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):

@@ -335,23 +335,12 @@ class ConnectionManager:
 
     Channel = Channel
 
-    def __init__(self, url, prefix, group_prefix, expiry, group_expiry,
-                 get_capacity, non_local_name, crypter):
-
+    def __init__(self, url):
         self.url = url
-        self.prefix = prefix
-        self.expiry = expiry
-        self.group_prefix = group_prefix
-        self.group_expiry = group_expiry
-        self.get_capacity = get_capacity
-        self.non_local_name = non_local_name
-        self.crypter = crypter
         self.connections = {}
         self.lock = asyncio.Lock()
 
-    # API
-
-    async def get_connection(self, loop=None):
+    async def get_connection(self, loop=None, on_open=None):
         """Get a connection for the given identifier and loop."""
 
         if loop is None:
@@ -362,29 +351,15 @@ class ConnectionManager:
                 # a chance to do some cleanup.
                 _wrap_close_loop(loop, self)
                 conn = await self.new_connection(loop)
+                if on_open:
+                    await on_open(conn)
                 self.connections[loop] = conn
         return self.connections[loop]
 
-    @asynccontextmanager
-    async def get_channel(self, close_after=True):
-        connection = await self.get_connection()
-        async with self.new_channel(connection, close_after) as channel:
-            yield channel
-
     # Helpers
 
-    def new_channel(self, connection, close_after=True):
-        return self.Channel(
-            connection, self.prefix, self.group_prefix, self.expiry,
-            self.group_expiry, self.get_capacity, self.non_local_name,
-            self.crypter, close_after=close_after,
-        )
-
     async def new_connection(self, loop):
-        connection = await aio_pika.connect_robust(self.url, loop=loop)
-        async with self.new_channel(connection, close_after=False) as channel:
-            await channel.declare_dead_letters()
-        return connection
+        return await aio_pika.connect_robust(self.url, loop=loop)
 
     async def close_loop(self, loop):
         """Close a connection owned by the pool on the given loop."""
@@ -404,6 +379,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     """
 
     ConnectionManager = ConnectionManager
+    Channel = Channel
 
     extensions = ['groups']
 
@@ -422,7 +398,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         super(RabbitmqChannelLayer, self).__init__(
             expiry=expiry, capacity=capacity, channel_capacity=channel_capacity
         )
-        self.url = url
+        self.connection_manager = self.ConnectionManager(url)
         self.prefix = prefix
         self.group_prefix = prefix if group_prefix is None else group_prefix
         self.client_prefix = ''.join(
@@ -431,10 +407,25 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         self.expiry = expiry
         self.group_expiry = group_expiry
         self.crypter = self.make_crypter(symmetric_encryption_keys)
-        self.connection = self.ConnectionManager(
-            self.url, self.prefix, self.group_prefix, self.expiry,
+
+    @asynccontextmanager
+    async def get_channel(self, close_after=True):
+        connection = await self.connection_manager.get_connection(
+            on_open=self.on_connection_open  # provide callback to declare DL
+        )
+        async with self._create_channel(connection, close_after) as channel:
+            yield channel
+
+    async def on_connection_open(self, connection):
+        # don't close the channel to keep dead-letter consumer working
+        async with self._create_channel(connection, False) as channel:
+            await channel.declare_dead_letters()
+
+    def _create_channel(self, connection, close_after=True):
+        return self.Channel(
+            connection, self.prefix, self.group_prefix, self.expiry,
             self.group_expiry, self.get_capacity, self.non_local_name,
-            self.crypter
+            self.crypter, close_after=close_after,
         )
 
     # API
@@ -511,7 +502,7 @@ class RabbitmqChannelLayer(BaseChannelLayer):
     ):
         while True:
             try:
-                async with self.connection.get_channel() as channel:
+                async with self.get_channel() as channel:
                     return await getattr(channel, method)(*args)
             except stop_on or ():
                 return

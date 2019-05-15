@@ -28,8 +28,8 @@ class ConnectionPool:
     loops. Copied almost as-is from django/channels_redis implementation.
     """
 
-    def __init__(self, url):
-        self.url = url
+    def __init__(self, manager):
+        self.manager = manager
         self.conn_map = {}
         self.lock = asyncio.Lock()
 
@@ -45,7 +45,7 @@ class ConnectionPool:
                 # Swap the loop's close method with our own so we get
                 # a chance to do some cleanup.
                 _wrap_close(loop, self)
-                conn = await aio_pika.connect_robust(self.url, loop=loop)
+                conn = await self.manager.new_connection(loop)
                 self.conn_map[loop] = conn
 
             return self.conn_map[loop]

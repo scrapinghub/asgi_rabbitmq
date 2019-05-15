@@ -4,13 +4,13 @@ import logging
 import random
 import string
 from contextlib import asynccontextmanager
-from functools import partial, wraps
+from functools import partial
 
 import asyncio
 import aio_pika
 import msgpack
 from aio_pika.exchange import ExchangeType
-from aiormq.exceptions import ChannelNotFoundEntity
+from aiormq.exceptions import ChannelNotFoundEntity, ChannelClosed
 from channels.exceptions import ChannelFull
 from channels.layers import BaseChannelLayer
 
@@ -323,7 +323,7 @@ class ConnectionManager:
     def __init__(self, url, prefix, group_prefix, expiry, group_expiry,
                  get_capacity, non_local_name, crypter):
 
-        self.connection_pool = ConnectionPool(url)
+        self.url = url
         self.prefix = prefix
         self.expiry = expiry
         self.group_prefix = group_prefix
@@ -331,19 +331,16 @@ class ConnectionManager:
         self.get_capacity = get_capacity
         self.non_local_name = non_local_name
         self.crypter = crypter
-
-        self.is_initialized = False
         self.lock = asyncio.Lock()
+        self.connection_pool = ConnectionPool(self)
 
-    async def initialize_connection(self, connection):
-        async with self.lock:
-            if not self.is_initialized:
-                dl_channel = self.channel(connection, close_after=False)
-                async with dl_channel as channel:
-                    await channel.declare_dead_letters()
-                    self.is_initialized = True
+    async def new_connection(self, loop):
+        connection = await aio_pika.connect_robust(self.url, loop=loop)
+        async with self.new_channel(connection, close_after=False) as channel:
+            await channel.declare_dead_letters()
+        return connection
 
-    def channel(self, connection, close_after=True):
+    def new_channel(self, connection, close_after=True):
         return self.Channel(
             connection, self.prefix, self.group_prefix, self.expiry,
             self.group_expiry, self.get_capacity, self.non_local_name,
@@ -353,7 +350,6 @@ class ConnectionManager:
     @asynccontextmanager
     async def get_connection(self):
         connection = await self.connection_pool.get()
-        await self.initialize_connection(connection)
         try:
             yield connection
         except Exception:
@@ -363,7 +359,7 @@ class ConnectionManager:
     @asynccontextmanager
     async def get_channel(self, close_after=True):
         async with self.get_connection() as connection:
-            async with self.channel(connection, close_after) as channel:
+            async with self.new_channel(connection, close_after) as channel:
                 yield channel
 
 
@@ -420,10 +416,9 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         # Make sure the message does not contain reserved keys
         assert '__asgi_channel__' not in message
 
-        async with self.connection.get_channel() as amqp_channel:
-            return await amqp_channel.send(
-                self._apply_channel_prefix(channel), message
-            )
+        return await self._schedule_until_success(
+            'send', self._apply_channel_prefix(channel), message,
+        )
 
     async def receive(self, channel):
         """Receive one message from the channel."""
@@ -431,11 +426,9 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         fail_msg = 'Channel name %s is not valid' % channel
         assert self.valid_channel_name(channel), fail_msg
 
-        async with self.connection.get_channel() as amqp_channel:
-            result = await amqp_channel.receive(
-                self._apply_channel_prefix(channel)
-            )
-            return result
+        return await self._schedule_until_success(
+            'receive', self._apply_channel_prefix(channel),
+        )
 
     async def new_channel(self, prefix='specific'):
         """Create new single reader channel."""
@@ -450,11 +443,11 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
-        async with self.connection.get_channel() as amqp_channel:
-            return await amqp_channel.group_add(
-                self._apply_group_prefix(group),
-                self._apply_channel_prefix(channel),
-            )
+        return await self._schedule_until_success(
+            'group_add',
+            self._apply_group_prefix(group),
+            self._apply_channel_prefix(channel),
+        )
 
     async def group_discard(self, group, channel):
         """Remove the channel from the group."""
@@ -462,23 +455,35 @@ class RabbitmqChannelLayer(BaseChannelLayer):
         assert self.valid_group_name(group), 'Group name is not valid'
         assert self.valid_channel_name(channel), 'Channel name is not valid'
 
-        async with self.connection.get_channel() as amqp_channel:
-            return await amqp_channel.group_discard(
-                self._apply_group_prefix(group),
-                self._apply_channel_prefix(channel),
-            )
+        return await self._schedule_until_success(
+            'group_discard',
+            self._apply_group_prefix(group),
+            self._apply_channel_prefix(channel),
+        )
 
     async def group_send(self, group, message):
         """Send the message to the group."""
 
         assert self.valid_group_name(group), 'Group name is not valid'
-        prefixed_group = self._apply_group_prefix(group)
-        async with self.connection.get_channel() as amqp_channel:
+
+        return await self._schedule_until_success(
+            'group_send', self._apply_group_prefix(group), message,
+            # ChannelNotFoundEntity:
+            # corresponding group exchange does not exist yet:
+            # no one called `group_add` yet, so group is empty
+            stop_on=(ChannelNotFoundEntity,), retry_on=None,
+        )
+
+    async def _schedule_until_success(
+        self, method, *args, retry_on=(ChannelClosed,), stop_on=None
+    ):
+        while True:
             try:
-                return await amqp_channel.group_send(prefixed_group, message)
-            except ChannelNotFoundEntity:
-                # corresponding group exchange does not exist yet:
-                # no one called `group_add` yet, so group is empty
+                async with self.connection.get_channel() as channel:
+                    return await getattr(channel, method)(*args)
+            except stop_on or ():
+                return
+            except retry_on or ():
                 pass
 
     # Crypto helpers.

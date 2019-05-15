@@ -348,19 +348,10 @@ class ConnectionManager:
         )
 
     @asynccontextmanager
-    async def get_connection(self):
-        connection = await self.connection_pool.get()
-        try:
-            yield connection
-        except Exception:
-            await self.connection_pool.conn_error(connection)
-            raise
-
-    @asynccontextmanager
     async def get_channel(self, close_after=True):
-        async with self.get_connection() as connection:
-            async with self.new_channel(connection, close_after) as channel:
-                yield channel
+        connection = await self.connection_pool.get()
+        async with self.new_channel(connection, close_after) as channel:
+            yield channel
 
 
 class RabbitmqChannelLayer(BaseChannelLayer):

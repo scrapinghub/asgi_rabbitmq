@@ -50,32 +50,20 @@ class ConnectionPool:
 
             return self.conn_map[loop]
 
-    async def conn_error(self, conn):
-        """
-        Handle a connection that produced an error.
-        """
-        await conn.close()
-        self.conn_map = {k: v for k, v in self.conn_map.items() if v != conn}
-
-    def reset(self):
-        """
-        Clear all connections from the pool.
-        """
-        self.conn_map = {}
-
     async def close_loop(self, loop):
         """
         Close all connections owned by the pool on the given loop.
         """
-        if loop in self.conn_map:
-            await self.conn_map[loop].close()
-            del self.conn_map[loop]
+        async with self.lock:
+            if loop in self.conn_map:
+                await self.conn_map[loop].close()
+                del self.conn_map[loop]
 
     async def close(self):
         """
         Close all connections owned by the pool.
         """
         conn_map = self.conn_map
-        self.reset()
+        self.conn_map = {}
         for conns in conn_map.values():
             await conn.close()

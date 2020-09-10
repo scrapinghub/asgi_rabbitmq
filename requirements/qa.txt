@@ -3,11 +3,10 @@ pytest-django>=3.0
 asgiref>=1.1.2
 daphne>=1.2.0
 channels>=1.1.8
-asgi_ipc>=1.4.2
 requests>=2.12
 websocket_client>=0.40
 tabulate>=0.7
 statistics ; python_version < "3.0"
-git+https://github.com/django/channels.git#egg=channels-benchmark&subdirectory=testproject
+https://github.com/django/channels/archive/ebe7100.zip#egg=channels-benchmark&subdirectory=testproject
 cryptography
 hunter

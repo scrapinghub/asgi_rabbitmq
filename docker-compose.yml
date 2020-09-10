@@ -16,123 +16,24 @@ services:
       - rabbitmq
     environment:
       RABBITMQ_HOST: rabbitmq
-      TOXENV: py27-django18,py27-django19,py27-django110,py27-django111
-  py27dj18:
-    <<: *py27
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py27-django18
-  py27dj19:
-    <<: *py27
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py27-django19
-  py27dj110:
-    <<: *py27
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py27-django110
+      TOXENV: py27-django111
   py27dj111:
     <<: *py27
     environment:
       RABBITMQ_HOST: rabbitmq
       TOXENV: py27-django111
-  py34: &py34
-    image: asgirabbitmq_py34
-    build:
-      context: .
-      dockerfile: compose/py34
-    command: tox
-    volumes:
-      - .:/code
-    depends_on:
-      - rabbitmq
+  py38dj111:
+    <<: *py38
     environment:
       RABBITMQ_HOST: rabbitmq
-      TOXENV: py34-django18,py34-django19,py34-django110,py34-django111,py34-django20
-  py34dj18:
-    <<: *py34
+      TOXENV: py38-django111
+  py38dj30:
+    <<: *py38
     environment:
       RABBITMQ_HOST: rabbitmq
-      TOXENV: py34-django18
-  py34dj19:
-    <<: *py34
+      TOXENV: py38-django30
+  py38dj31:
+    <<: *py38
     environment:
       RABBITMQ_HOST: rabbitmq
-      TOXENV: py34-django19
-  py34dj110:
-    <<: *py34
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py34-django110
-  py34dj111:
-    <<: *py34
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py34-django111
-  py34dj20:
-    <<: *py34
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py34-django20
-  py35: &py35
-    image: asgirabbitmq_py35
-    build:
-      context: .
-      dockerfile: compose/py35
-    command: tox
-    volumes:
-      - .:/code
-    depends_on:
-      - rabbitmq
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py35-django18,py35-django19,py35-django110,py35-django111,py35-django20
-  py35dj18:
-    <<: *py35
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py35-django18
-  py35dj19:
-    <<: *py35
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py35-django19
-  py35dj110:
-    <<: *py35
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py35-django110
-  py35dj111:
-    <<: *py35
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py35-django111
-  py35dj20:
-    <<: *py35
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py35-django20
-  py36: &py36
-    image: asgirabbitmq_py36
-    build:
-      context: .
-      dockerfile: compose/py36
-    command: tox
-    volumes:
-      - .:/code
-    depends_on:
-      - rabbitmq
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py36-django18,py36-django19,py36-django110,py36-django111,py36-django20
-  py36dj111:
-    <<: *py36
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py36-django111
-  py36dj20:
-    <<: *py36
-    environment:
-      RABBITMQ_HOST: rabbitmq
-      TOXENV: py36-django20
+      TOXENV: py38-django31

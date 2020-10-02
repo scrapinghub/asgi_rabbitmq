@@ -18,7 +18,7 @@ setup(
         'pika~=0.10.0',
         'asgiref~=3.2.0',
         'channels~=2.4.0',
-        'msgpack-python',
+        'msgpack~=1.0.0',
         'cached-property',
         'futures ; python_version < "3.0"',
     ],

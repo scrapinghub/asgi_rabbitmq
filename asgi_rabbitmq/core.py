@@ -554,7 +554,7 @@ class Protocol(object):
     def serialize(self, message):
         """Serialize message."""
 
-        value = msgpack.packb(message, use_bin_type=True)
+        value = msgpack.packb(message)
         if self.crypter:
             value = self.crypter.encrypt(value)
         return value
@@ -564,7 +564,7 @@ class Protocol(object):
 
         if self.crypter:
             message = self.crypter.decrypt(message, self.expiry + 10)
-        return msgpack.unpackb(message, raw=False)
+        return msgpack.unpackb(message)
 
 
 class LayerChannel(Channel):
